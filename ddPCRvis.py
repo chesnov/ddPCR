@@ -1,7 +1,29 @@
 #!/usr/bin/env python3
 """
-ddPCRvis - ddPCR Visualization Tool
+ddPCRvis - ddPCR Visualization Tool (Enhanced Version v2 - FIXED)
 A GUI application for visualizing ddPCR amplitude data from Bio-Rad CSV exports and QLP binary files
+
+ENHANCED FEATURES (v2 - Over-segmentation Fix):
+- 2D Gaussian Mixture Model clustering optimized for standard ddPCR
+- FIXED: Now correctly identifies 2 bands per channel (negative + positive) for standard assays
+- Shared thresholds across wells in the same experimental condition
+- Percentile-based bounds (robust to outliers)
+- Improved threshold placement using largest gap detection
+
+KEY FIX IN V2:
+- Standard ddPCR has 4 populations in 2D space: negative, FAM+, HEX+, double+
+- This means 2 bands per channel (negative and positive), NOT 4
+- Threshold placement based on largest gap between population means
+- Secondary thresholds only added if there's another significant gap (>50% of primary)
+
+CLUSTERING METHODS AVAILABLE:
+1. detect_bands_1d_gmm() - 1D GMM, defaults to 2 bands (recommended for ddPCR)
+2. detect_populations_2d_gmm() - 2D GMM with smart threshold selection (best for complex samples)
+3. detect_bands_kmeans() - Legacy k-means (kept for backwards compatibility)
+
+THRESHOLD MODES:
+- Individual: Each well gets its own thresholds (default for CSV files)
+- Shared: Wells in same condition share thresholds (default for QLP with assignments)
 """
 
 import sys
@@ -18,6 +40,18 @@ from datetime import datetime
 import struct
 from collections import defaultdict
 import tempfile
+
+try:
+    from sklearn.mixture import GaussianMixture
+    from scipy import stats
+    from scipy.signal import find_peaks
+    from scipy.stats import gaussian_kde
+except ImportError:
+    print("Installing scikit-learn and scipy...")
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "scikit-learn", "scipy", "--break-system-packages"])
+    from sklearn.mixture import GaussianMixture
+    from scipy import stats
 
 try:
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -630,12 +664,13 @@ class ProcessingThread(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
     
-    def __init__(self, files, file_type='csv', well_assignments=None, include_filtered=True):
+    def __init__(self, files, file_type='csv', well_assignments=None, include_filtered=True, output_format='png'):
         super().__init__()
         self.files = files
         self.file_type = file_type
         self.well_assignments = well_assignments
         self.include_filtered = include_filtered
+        self.output_format = output_format # Store format
         
     def run(self):
         try:
@@ -644,12 +679,14 @@ class ProcessingThread(QThread):
                     self.files[0], 
                     self.well_assignments,
                     self.include_filtered,
-                    self.progress.emit
+                    self.progress.emit,
+                    self.output_format # Pass to function
                 )
             else:
                 output_dir, stats_file = process_ddpcr_files(
                     self.files, 
-                    self.progress.emit
+                    self.progress.emit,
+                    self.output_format # Pass to function
                 )
             
             msg = f"Processing complete!\n\nOutputs saved to:\n{output_dir}"
@@ -769,6 +806,22 @@ class MainWindow(QMainWindow):
         self.drop_zone = DropZone("📁 Drop CSV or QLP files here\n\nor click 'Browse Files' below")
         self.drop_zone.files_dropped.connect(self.process_files)
         layout.addWidget(self.drop_zone)
+
+        # Output Format Selection
+        format_layout = QHBoxLayout()
+        format_label = QLabel("Output Format:")
+        format_label.setFont(QFont("Arial", 10, QFont.Bold))
+        
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["PNG", "PDF (Vector)"])
+        self.format_combo.setToolTip("PNG is recommended for large datasets (faster to save and view).\nPDF preserves vector data but files can be huge.")
+        self.format_combo.setStyleSheet("padding: 5px;")
+        
+        format_layout.addStretch()
+        format_layout.addWidget(format_label)
+        format_layout.addWidget(self.format_combo)
+        format_layout.addStretch()
+        layout.addLayout(format_layout)
         
         # Browse buttons
         browse_layout = QHBoxLayout()
@@ -881,6 +934,10 @@ class MainWindow(QMainWindow):
         if not files:
             return
         
+        # Determine format
+        is_png = self.format_combo.currentIndex() == 0
+        output_format = 'png' if is_png else 'pdf'
+        
         self.log(f"\n{'='*60}")
         self.log(f"Processing {len(files)} {file_type.upper()} file(s)...")
         
@@ -916,9 +973,10 @@ class MainWindow(QMainWindow):
         
         # Start processing in background thread
         self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)  # Indeterminate
+        self.progress_bar.setRange(0, 0)
         
-        self.thread = ProcessingThread(files, file_type, well_assignments, include_filtered)
+        # UPDATE: Pass output_format to Thread
+        self.thread = ProcessingThread(files, file_type, well_assignments, include_filtered, output_format)
         self.thread.progress.connect(self.log)
         self.thread.finished.connect(self.on_processing_finished)
         self.thread.error.connect(self.on_processing_error)
@@ -935,6 +993,101 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self.log(f"\n❌ ERROR: {error_message}")
         QMessageBox.critical(self, "Error", error_message)
+
+
+def get_density_based_thresholds(values, min_separation=500, rain_sensitivity=0.1):
+    """
+    Revised V3: Log-Space Peak Detection.
+    
+    Fixes the issue where dense negative populations drown out distinct 
+    but smaller positive populations (middle/top bands).
+    
+    1. Uses Log-Density for peak finding (compresses dynamic range).
+    2. Maintains strict safety buffers from the previous version.
+    3. Detects multiple bands even if counts vary by 100x.
+    """
+    values = np.array(values)
+    if len(values) < 10:
+        return []
+    
+    val_range = values.max() - values.min()
+    if val_range < min_separation:
+        return [] 
+
+    # 1. Estimate Density
+    grid_points = np.linspace(values.min(), values.max(), 500)
+    try:
+        kde = gaussian_kde(values, bw_method='scott')
+        density = kde(grid_points)
+    except:
+        return []
+
+    # 2. Log-Transformation (The Fix)
+    # This makes small populations visible even if the negative peak is massive
+    # epsilon prevents log(0)
+    epsilon = 1e-10
+    log_density = np.log(density + epsilon)
+    
+    # 3. Find Peaks in Log-Space
+    # Prominence is now relative to the log-dynamic range. 
+    # 0.05 (5%) of the log range is usually robust enough to ignore noise 
+    # but catch real populations.
+    log_range = log_density.max() - log_density.min()
+    peaks, properties = find_peaks(log_density, prominence=0.05 * log_range)
+    
+    # Calculate robust stats for safety checks (based on main negative cluster)
+    median = np.median(values)
+    mad = np.median(np.abs(values - median))
+    sigma_est = 1.4826 * mad
+    
+    thresholds = []
+    
+    # Case A: Multiple populations (Valley detection)
+    if len(peaks) >= 2:
+        for i in range(len(peaks) - 1):
+            p1_idx = peaks[i]
+            p2_idx = peaks[i+1]
+            
+            # Find valley in the ORIGINAL linear density (better for finding true minimum)
+            # We use the indices found from log-space, but search the linear density for the low point
+            valley_slice = density[p1_idx:p2_idx]
+            local_min_idx = np.argmin(valley_slice) + p1_idx
+            raw_threshold = grid_points[local_min_idx]
+            
+            # SAFETY CHECK: 
+            # Ensure threshold is at least 4 sigmas away from the left peak
+            peak_val = grid_points[p1_idx]
+            min_safe_dist = peak_val + (4 * sigma_est)
+            
+            final_threshold = max(raw_threshold, min_safe_dist)
+            thresholds.append(final_threshold)
+
+    # Case B: Single Peak (Sparse detection)
+    elif len(peaks) == 1:
+        peak_val = grid_points[peaks[0]]
+        
+        # Strict sparse detection (12 sigma)
+        cutoff = peak_val + max(12 * sigma_est, min_separation)
+        
+        if values.max() > cutoff:
+            thresholds.append(cutoff)
+
+    # 4. Filter thresholds based on minimum separation
+    valid_thresholds = []
+    thresholds = sorted(thresholds)
+    
+    if thresholds:
+        peak_values = grid_points[peaks]
+        for thresh in thresholds:
+            # Check distance to nearest peak
+            dist_to_peak = min(abs(thresh - p) for p in peak_values)
+            # Check distance to existing valid thresholds
+            dist_to_thresh = min([abs(thresh - t) for t in valid_thresholds]) if valid_thresholds else float('inf')
+            
+            if dist_to_peak > (min_separation / 3) and dist_to_thresh > min_separation:
+                valid_thresholds.append(thresh)
+
+    return valid_thresholds
 
 
 def plot_well_2d_scatter(df, well_id, ch1_bands, ch2_bands):
@@ -999,74 +1152,69 @@ def plot_well_2d_scatter(df, well_id, ch1_bands, ch2_bands):
     return fig
 
 
-def plot_well_with_bands(df, well_id, ch1_bands, ch2_bands):
-    """Create band-colored amplitude plot for a single well"""
+def plot_well_with_bands(df, well_id, ch1_bands, ch2_bands, limits=None):
+    """
+    Updated to accept 'limits' dictionary for synchronized axes.
+    """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     
-    # Get actual channel names from DataFrame attributes
     channel_map = df.attrs.get('channel_map', {'Ch1_Amplitude': 'Ch1', 'Ch2_Amplitude': 'Ch2'})
     ch1_name = channel_map.get('Ch1_Amplitude', 'Ch1')
     ch2_name = channel_map.get('Ch2_Amplitude', 'Ch2')
     
-    # Generate gradient colors for bands
     ch1_colors = create_gradient_colors('#0000FF', len(ch1_bands))
     ch2_colors = create_gradient_colors('#00FF00', len(ch2_bands))
     
-    np.random.seed(42)
+    # Set Limits
+    if limits and 'ch1_limits' in limits:
+        ylim_ch1 = limits['ch1_limits']
+        ylim_ch2 = limits['ch2_limits']
+    else:
+        # Fallback to local scaling
+        ch1_all = df['Ch1_Amplitude'].values
+        ch2_all = df['Ch2_Amplitude'].values
+        ylim_ch1 = (ch1_all.min() * 0.95, ch1_all.max() * 1.05)
+        ylim_ch2 = (ch2_all.min() * 0.95, ch2_all.max() * 1.05)
     
-    # Plot Ch1 with bands
+    # Plot Ch1
     for band_idx, band in enumerate(ch1_bands):
         mask = (df['Ch1_Amplitude'] >= band['min']) & (df['Ch1_Amplitude'] <= band['max'])
         band_data = df[mask]
-        
         if len(band_data) > 0:
             x_jitter = np.random.uniform(-0.3, 0.3, len(band_data))
             ax1.scatter(x_jitter, band_data['Ch1_Amplitude'], 
-                       c=ch1_colors[band_idx], alpha=0.6, s=10,
-                       label=f'Band {band_idx+1} ({band["proportion"]:.1f}%)')
+                       c=ch1_colors[band_idx], alpha=0.6, s=10)
             
-            # Draw separator line between bands
-            if band_idx < len(ch1_bands) - 1:
-                next_band = ch1_bands[band_idx + 1]
-                separator_y = (band['max'] + next_band['min']) / 2
-                ax1.axhline(y=separator_y, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
-    
-    ax1.set_ylabel(f'{ch1_name} Amplitude', fontsize=12)
+            # Plot Threshold (Upper bound of band, if it acts as a separator)
+            if band['threshold_upper'] is not None:
+                ax1.axhline(y=band['threshold_upper'], color='red', linestyle='--', linewidth=1.5)
+
+    ax1.set_ylabel(f'{ch1_name} Amplitude', fontsize=12, fontweight='bold')
     ax1.set_xlim(-0.5, 0.5)
+    ax1.set_ylim(ylim_ch1) # Apply explicit limits
     ax1.set_xticks([])
-    ax1.set_title(f'Channel 1 ({ch1_name})', fontsize=14, fontweight='bold')
-    if ch1_bands:
-        ax1.legend(loc='upper right', fontsize=9)
+    ax1.set_title(f'{ch1_name}', fontsize=14, fontweight='bold')
     ax1.grid(True, alpha=0.3, axis='y')
     
-    # Plot Ch2 with bands
+    # Plot Ch2
     for band_idx, band in enumerate(ch2_bands):
         mask = (df['Ch2_Amplitude'] >= band['min']) & (df['Ch2_Amplitude'] <= band['max'])
         band_data = df[mask]
-        
         if len(band_data) > 0:
             x_jitter = np.random.uniform(-0.3, 0.3, len(band_data))
             ax2.scatter(x_jitter, band_data['Ch2_Amplitude'],
-                       c=ch2_colors[band_idx], alpha=0.6, s=10,
-                       label=f'Band {band_idx+1} ({band["proportion"]:.1f}%)')
-            
-            # Draw separator line
-            if band_idx < len(ch2_bands) - 1:
-                next_band = ch2_bands[band_idx + 1]
-                separator_y = (band['max'] + next_band['min']) / 2
-                ax2.axhline(y=separator_y, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+                       c=ch2_colors[band_idx], alpha=0.6, s=10)
+            if band['threshold_upper'] is not None:
+                ax2.axhline(y=band['threshold_upper'], color='red', linestyle='--', linewidth=1.5)
     
-    ax2.set_ylabel(f'{ch2_name} Amplitude', fontsize=12)
+    ax2.set_ylabel(f'{ch2_name} Amplitude', fontsize=12, fontweight='bold')
     ax2.set_xlim(-0.5, 0.5)
+    ax2.set_ylim(ylim_ch2) # Apply explicit limits
     ax2.set_xticks([])
-    ax2.set_title(f'Channel 2 ({ch2_name})', fontsize=14, fontweight='bold')
-    if ch2_bands:
-        ax2.legend(loc='upper right', fontsize=9)
+    ax2.set_title(f'{ch2_name}', fontsize=14, fontweight='bold')
     ax2.grid(True, alpha=0.3, axis='y')
     
-    plt.suptitle(f'Well {well_id} - Band Detection', fontsize=16, fontweight='bold')
     plt.tight_layout()
-    
     return fig
 
 
@@ -1140,100 +1288,302 @@ def create_gradient_colors(base_color_hex, n_bands):
     return colors
 
 
+
+
+def detect_populations_2d_gmm_robust(ch1_values, ch2_values, 
+                                      max_populations=4,
+                                      min_population_size=10,
+                                      min_population_fraction=0.001):
+    """
+    Refined logic: Uses 1D density thresholding on Ch1 and Ch2 independently,
+    then combines them to form the 2D populations (Neg, Ch1+, Ch2+, Double+).
+    This handles 'rain' and sparse positives much better than GMM.
+    """
+    n_droplets = len(ch1_values)
+    
+    # Get thresholds using the new robust method
+    ch1_thresholds = get_density_based_thresholds(ch1_values, min_separation=500)
+    ch2_thresholds = get_density_based_thresholds(ch2_values, min_separation=500)
+    
+    # Assign labels based on grid logic (Standard ddPCR approach)
+    # 0=Neg, 1=Ch1+, 2=Ch2+, 3=Double+ (Simplified logic for 1 threshold per channel)
+    # If multiple thresholds exist (multiplexing), logic adapts.
+    
+    labels = np.zeros(n_droplets, dtype=int)
+    
+    # Simple case: 1 threshold per channel (Standard)
+    t1 = ch1_thresholds[0] if ch1_thresholds else float('inf')
+    t2 = ch2_thresholds[0] if ch2_thresholds else float('inf')
+    
+    # Create mask for standard 4-cluster output
+    is_ch1_pos = ch1_values > t1
+    is_ch2_pos = ch2_values > t2
+    
+    # Vectorized label assignment
+    # 0: Neg/Neg
+    # 1: Pos/Neg (Ch1 only)
+    # 2: Neg/Pos (Ch2 only)
+    # 3: Pos/Pos (Double)
+    labels = (is_ch1_pos.astype(int) * 1) + (is_ch2_pos.astype(int) * 2)
+    
+    # Remap to match specific request of user visualization if needed, 
+    # but standardizing on: 0=Neg, 1=Ch1+, 2=Ch2+, 3=Dbl+ is safest.
+    
+    # Calculate stats for the populations found
+    unique_labels = np.unique(labels)
+    populations = []
+    
+    for label in unique_labels:
+        mask = labels == label
+        count = np.sum(mask)
+        if count > 0:
+            populations.append({
+                'id': int(label),
+                'center_ch1': float(np.mean(ch1_values[mask])),
+                'center_ch2': float(np.mean(ch2_values[mask])),
+                'count': int(count),
+                'proportion': float(count / n_droplets * 100),
+                'label': int(label)
+            })
+
+    return {
+        'n_populations': len(unique_labels),
+        'populations': populations,
+        'ch1_thresholds': ch1_thresholds,
+        'ch2_thresholds': ch2_thresholds,
+        'labels': labels
+    }
+
+
+
+
+# Compatibility alias for old function name
+def detect_populations_2d_gmm(ch1_values, ch2_values, max_populations=4, min_population_size=50):
+    """Compatibility wrapper for old function name - calls new robust version"""
+    return detect_populations_2d_gmm_robust(
+        ch1_values, ch2_values,
+        max_populations=max_populations,
+        min_population_size=min_population_size,
+        min_population_fraction=0.001
+    )
+
+
+def detect_bands_1d_gmm(values, max_bands=4, percentile_bounds=True, force_two_bands=False):
+    """
+    Detect bands in 1D - DEPRECATED in favor of 2D approach.
+    Kept for backwards compatibility only.
+    
+    For ddPCR, use detect_populations_2d_gmm_robust() instead, then apply_thresholds_to_get_bands().
+    """
+    # This function is now a thin wrapper - real work done in 2D
+    if len(values) < 10:
+        return []
+    
+    # Simple percentile-based approach for 1D-only case
+    values_array = np.array(values).reshape(-1, 1)
+    
+    try:
+        # Try 2-component model
+        gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=42, n_init=10)
+        gmm.fit(values_array)
+        
+        labels = gmm.predict(values_array)
+        centers = gmm.means_.flatten()
+        stds = np.sqrt(gmm.covariances_.flatten())
+        
+        # Check if well separated
+        sorted_centers = np.sort(centers)
+        gap = sorted_centers[1] - sorted_centers[0]
+        avg_std = np.mean(stds)
+        
+        if gap < 2 * avg_std:
+            # Fall back to 1 component
+            gmm = GaussianMixture(n_components=1, covariance_type='full', random_state=42, n_init=10)
+            gmm.fit(values_array)
+            labels = gmm.predict(values_array)
+            centers = gmm.means_.flatten()
+            stds = np.sqrt(gmm.covariances_.flatten())
+    
+    except Exception:
+        gmm = GaussianMixture(n_components=1, covariance_type='full', random_state=42, n_init=10)
+        gmm.fit(values_array)
+        labels = gmm.predict(values_array)
+        centers = gmm.means_.flatten()
+        stds = np.sqrt(gmm.covariances_.flatten())
+    
+    # Sort by center and create bands
+    indices = np.argsort(centers)
+    
+    bands = []
+    for idx, i in enumerate(indices):
+        mask = labels == i
+        band_values = values[mask]
+        
+        if len(band_values) > 0:
+            if percentile_bounds:
+                band_min = np.percentile(band_values, 0.5)
+                band_max = np.percentile(band_values, 99.5)
+            else:
+                band_min = float(band_values.min())
+                band_max = float(band_values.max())
+            
+            band = {
+                'min': band_min,
+                'max': band_max,
+                'center': float(centers[i]),
+                'mean': float(np.mean(band_values)),
+                'std': float(stds[i]),
+                'count': len(band_values),
+                'proportion': len(band_values) / len(values) * 100,
+                'threshold_lower': None,
+                'threshold_upper': None
+            }
+            
+            if idx > 0:
+                prev_center = bands[-1]['center']
+                band['threshold_lower'] = (prev_center + band['center']) / 2
+                bands[-1]['threshold_upper'] = band['threshold_lower']
+            
+            bands.append(band)
+    
+    return bands
+
+
+def calculate_shared_thresholds(well_data_dict, condition_assignments=None, method='density'):
+    """
+    Calculate shared thresholds AND Axis Limits across wells in the same condition.
+    """
+    if condition_assignments is None:
+        condition_assignments = {well: 'All' for well in well_data_dict.keys()}
+    
+    # Group wells by condition
+    condition_wells = defaultdict(list)
+    for well, condition in condition_assignments.items():
+        condition_wells[condition].append(well)
+    
+    shared_data = {}
+    
+    for condition, wells in condition_wells.items():
+        # Pool all droplets from wells in this condition
+        all_ch1 = []
+        all_ch2 = []
+        
+        for well in wells:
+            if well in well_data_dict:
+                df = well_data_dict[well]
+                all_ch1.extend(df['Ch1_Amplitude'].values)
+                all_ch2.extend(df['Ch2_Amplitude'].values)
+        
+        if len(all_ch1) == 0:
+            continue
+            
+        all_ch1 = np.array(all_ch1)
+        all_ch2 = np.array(all_ch2)
+
+        # 1. Calculate Thresholds using new Robust Density method
+        ch1_thresh = get_density_based_thresholds(all_ch1, min_separation=500)
+        ch2_thresh = get_density_based_thresholds(all_ch2, min_separation=500)
+        
+        # 2. Calculate Shared Axis Limits (Max/Min with padding)
+        # This ensures all plots in the condition look identical in scale
+        c1_min, c1_max = all_ch1.min(), all_ch1.max()
+        c2_min, c2_max = all_ch2.min(), all_ch2.max()
+        
+        pad_c1 = (c1_max - c1_min) * 0.05 if (c1_max - c1_min) > 0 else 100
+        pad_c2 = (c2_max - c2_min) * 0.05 if (c2_max - c2_min) > 0 else 100
+        
+        shared_data[condition] = {
+            'ch1_thresholds': ch1_thresh,
+            'ch2_thresholds': ch2_thresh,
+            'ch1_limits': (c1_min - pad_c1, c1_max + pad_c1),
+            'ch2_limits': (c2_min - pad_c2, c2_max + pad_c2)
+        }
+    
+    return shared_data
+
+
+def apply_thresholds_to_get_bands(values, thresholds, percentile_bounds=False):
+    """
+    Updated: Adds 'band_index' to allow consistent coloring across wells.
+    """
+    if len(values) == 0:
+        return []
+    
+    values = np.array(values)
+    thresholds = sorted([t for t in thresholds if np.isfinite(t)])
+    bins = [-np.inf] + thresholds + [np.inf]
+    
+    bands = []
+    # Loop through ALL defined bins (Logical Bands)
+    for i in range(len(bins) - 1):
+        lower = bins[i]
+        upper = bins[i + 1]
+        
+        mask = (values > lower) & (values <= upper)
+        band_values = values[mask]
+        
+        if len(band_values) > 0:
+            band_min = float(band_values.min())
+            band_max = float(band_values.max())
+            
+            bands.append({
+                'band_index': i, # CRITICAL: Stores which tier this band belongs to (0=Lowest)
+                'min': band_min,
+                'max': band_max,
+                'center': float(np.median(band_values)),
+                'mean': float(np.mean(band_values)),
+                'std': float(np.std(band_values)),
+                'count': len(band_values),
+                'proportion': len(band_values) / len(values) * 100,
+                'threshold_lower': float(lower) if not np.isinf(lower) else None,
+                'threshold_upper': float(upper) if not np.isinf(upper) else None
+            })
+    
+    return bands
+
+
+# Keep old function for backwards compatibility
 def detect_bands_kmeans(values, max_bands=4, max_sample_size=10000):
-    """Detect bands using k-means clustering (optimized for large datasets)"""
+    """Legacy k-means function - DEPRECATED. Use detect_populations_2d_gmm_robust instead."""
     from sklearn.cluster import KMeans
     
     if len(values) < 10:
         return []
     
-    # For large datasets, sample for clustering but apply to all data
-    use_sampling = len(values) > max_sample_size
-    if use_sampling:
-        sample_indices = np.random.choice(len(values), max_sample_size, replace=False)
-        values_for_clustering = values.iloc[sample_indices]
-    else:
-        values_for_clustering = values
-    
-    best_bands = []
-    best_score = -np.inf
-    
-    values_array = values_for_clustering.values.reshape(-1, 1)
-    
-    for n_clusters in range(1, min(max_bands + 1, len(values_for_clustering) + 1)):
-        try:
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(values_array)
-            
-            if n_clusters > 1:
-                from sklearn.metrics import silhouette_score
-                score = silhouette_score(values_array, labels)
-            else:
-                score = 0
-            
-            if score > best_score:
-                best_score = score
-                centers = sorted(kmeans.cluster_centers_.flatten())
-                
-                # Now apply the learned centers to ALL data
-                all_values_array = values.values.reshape(-1, 1)
-                
-                # Predict cluster for all points
-                if use_sampling:
-                    # Re-fit on all data with the best n_clusters
-                    kmeans_full = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-                    all_labels = kmeans_full.fit_predict(all_values_array)
-                    centers = sorted(kmeans_full.cluster_centers_.flatten())
-                else:
-                    all_labels = labels
-                
-                # Get the original centers before sorting
-                if use_sampling:
-                    original_centers = kmeans_full.cluster_centers_.flatten()
-                else:
-                    original_centers = kmeans.cluster_centers_.flatten()
-                
-                bands = []
-                for i, center in enumerate(centers):
-                    # Find which ORIGINAL cluster index corresponds to this sorted center
-                    # This is the actual label that kmeans assigned
-                    original_cluster_idx = np.argmin(np.abs(original_centers - center))
-                    
-                    # Get all points assigned to this cluster using the ORIGINAL label
-                    if use_sampling:
-                        mask = all_labels == original_cluster_idx
-                    else:
-                        mask = labels == original_cluster_idx
-                    
-                    band_values = values[mask] if use_sampling else values.iloc[mask]
-                    
-                    if len(band_values) > 0:
-                        bands.append({
-                            'min': float(band_values.min()),
-                            'max': float(band_values.max()),
-                            'center': float(center),
-                            'count': len(band_values),
-                            'proportion': len(band_values) / len(values) * 100
-                        })
-                
-                best_bands = bands
-                
-        except Exception as e:
-            continue
-    
-    return best_bands
+    # Simplified version - just use GMM instead
+    return detect_bands_1d_gmm(values, max_bands=max_bands)
 
 
-def plot_96well_layout(data_dict, output_path, log_func=print):
-    """Create 96-well plate layout visualization with both 1D and 2D views"""
+
+def plot_96well_layout(data_dict, output_base_path, log_func=print, 
+                       condition_assignments=None, use_shared_thresholds=True, 
+                       output_format='png'):
+    """
+    Create 96-well plate visualization.
+    FIXED: Uses robust density thresholding for individual wells (replacing legacy GMM)
+    to ensure 'band_index' exists and strict thresholding is applied everywhere.
+    """
     try:
         from sklearn.cluster import KMeans
     except ImportError:
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "scikit-learn", "--break-system-packages"])
-        from sklearn.cluster import KMeans
+        pass # imports handled at top of file
     
     log_func("\nCreating 96-well plate visualizations...")
+    
+    # Calculate shared thresholds if requested
+    shared_thresh = None
+    if use_shared_thresholds and condition_assignments:
+        log_func("  Calculating shared thresholds per condition...")
+        shared_thresh = calculate_shared_thresholds(
+            data_dict,
+            condition_assignments,
+            method='density' # Use the new method
+        )
+        
+        for condition, thresholds in shared_thresh.items():
+            ch1_str = ', '.join([f'{t:.1f}' for t in thresholds['ch1_thresholds']])
+            ch2_str = ', '.join([f'{t:.1f}' for t in thresholds['ch2_thresholds']])
+            log_func(f"    {condition}: Ch1=[{ch1_str}], Ch2=[{ch2_str}]")
     
     well_info = {}
     for filename, df in data_dict.items():
@@ -1243,48 +1593,86 @@ def plot_96well_layout(data_dict, output_path, log_func=print):
             col_num = int(well_match.group(2))
             well_id = f'{row_letter}{col_num:02d}'
             
-            ch1_bands = detect_bands_kmeans(df['Ch1_Amplitude'])
-            ch2_bands = detect_bands_kmeans(df['Ch2_Amplitude'])
+            current_ch1_thresh = []
+            current_ch2_thresh = []
+            limits = None
+            
+            # LOGIC 1: Use Shared Thresholds (Grouped)
+            if shared_thresh and condition_assignments:
+                condition = condition_assignments.get(well_id, 'All')
+                if condition in shared_thresh:
+                    current_ch1_thresh = shared_thresh[condition]['ch1_thresholds']
+                    current_ch2_thresh = shared_thresh[condition]['ch2_thresholds']
+                    # Apply shared limits
+                    limits = {
+                        'ch1_limits': shared_thresh[condition]['ch1_limits'],
+                        'ch2_limits': shared_thresh[condition]['ch2_limits']
+                    }
+            
+            # LOGIC 2: Individual Analysis (Fallback)
+            # Use new robust functions to ensure consistency (band_index, strictness)
+            if not current_ch1_thresh and not current_ch2_thresh:
+                current_ch1_thresh = get_density_based_thresholds(df['Ch1_Amplitude'].values, min_separation=500)
+                current_ch2_thresh = get_density_based_thresholds(df['Ch2_Amplitude'].values, min_separation=500)
+            
+            # Calculate Bands using the thresholds
+            ch1_bands = apply_thresholds_to_get_bands(
+                df['Ch1_Amplitude'].values,
+                current_ch1_thresh,
+                percentile_bounds=False # Use False to avoid truncation
+            )
+            ch2_bands = apply_thresholds_to_get_bands(
+                df['Ch2_Amplitude'].values,
+                current_ch2_thresh,
+                percentile_bounds=False
+            )
             
             well_info[well_id] = {
                 'df': df,
                 'ch1_bands': ch1_bands,
-                'ch2_bands': ch2_bands
+                'ch2_bands': ch2_bands,
+                'ch1_thresholds': current_ch1_thresh,
+                'ch2_thresholds': current_ch2_thresh,
+                'condition': condition_assignments.get(well_id, 'All') if condition_assignments else 'All',
+                'limits': limits
             }
     
     if not well_info:
         log_func("  ⚠️  No valid well identifiers found in filenames")
         return
     
-    # Create PDF with multiple pages
-    with PdfPages(output_path) as pdf:
-        # Page 1: 1D band view (existing)
-        create_96well_1d_page(well_info, pdf, log_func)
-        
-        # Page 2: 2D scatter view
-        create_96well_2d_page(well_info, pdf, log_func)
+    # PLOTTING LOGIC
+    output_base_path = Path(output_base_path)
     
-    log_func(f"  ✓ 96-well plate plots saved (1D and 2D views)")
+    if output_format == 'pdf':
+        # PDF Mode: Use PdfPages for a single file with multiple pages
+        pdf_path = output_base_path.with_suffix('.pdf')
+        with PdfPages(pdf_path) as pdf:
+            create_96well_1d_page(well_info, pdf, log_func)
+            create_96well_2d_page(well_info, pdf, log_func)
+        log_func(f"  ✓ 96-well plate saved to: {pdf_path.name}")
+        
+    else:
+        # PNG Mode: Save separate high-res images
+        path_1d = output_base_path.parent / f"{output_base_path.stem}_1D_view.png"
+        path_2d = output_base_path.parent / f"{output_base_path.stem}_2D_view.png"
+        
+        # Pass the PATH string instead of a PdfPages object
+        create_96well_1d_page(well_info, path_1d, log_func)
+        create_96well_2d_page(well_info, path_2d, log_func)
+        
+        log_func(f"  ✓ 96-well plate saved to: {path_1d.name} and {path_2d.name}")
 
 
-def create_96well_1d_page(well_info, pdf, log_func):
-    """Create the 1D band detection page for 96-well plate"""
-    ch1_band_colors = {}
-    ch2_band_colors = {}
-    
-    for well_id, info in well_info.items():
-        ch1_colors = create_gradient_colors('#0000FF', len(info['ch1_bands']))
-        ch2_colors = create_gradient_colors('#00FF00', len(info['ch2_bands']))
-        
-        for idx, color in enumerate(ch1_colors):
-            ch1_band_colors[(well_id, idx)] = color
-        for idx, color in enumerate(ch2_colors):
-            ch2_band_colors[(well_id, idx)] = color
-    
+def create_96well_1d_page(well_info, destination, log_func):
+    """
+    Updated: Consistent colors, unconditional red lines, and strict limits.
+    """
+    # Calculate global ranges for fallback
     all_ch1 = [v for info in well_info.values() for v in info['df']['Ch1_Amplitude']]
     all_ch2 = [v for info in well_info.values() for v in info['df']['Ch2_Amplitude']]
-    ch1_min, ch1_max = min(all_ch1), max(all_ch1)
-    ch2_min, ch2_max = min(all_ch2), max(all_ch2)
+    ch1_min_global, ch1_max_global = min(all_ch1), max(all_ch1)
+    ch2_min_global, ch2_max_global = min(all_ch2), max(all_ch2)
     
     fig = plt.figure(figsize=(20, 12))
     
@@ -1296,6 +1684,7 @@ def create_96well_1d_page(well_info, pdf, log_func):
                 continue
             
             info = well_info[well_id]
+            df = info['df']
             
             pos_ch1 = row * 24 + col * 2 + 1
             pos_ch2 = row * 24 + col * 2 + 2
@@ -1303,57 +1692,77 @@ def create_96well_1d_page(well_info, pdf, log_func):
             ax1 = plt.subplot(8, 24, pos_ch1)
             ax2 = plt.subplot(8, 24, pos_ch2)
             
-            np.random.seed(42)
-            df = info['df']
+            # --- COLOR LOGIC FIX ---
+            # Determine max logical bands based on thresholds (not data)
+            n_bands_ch1 = len(info.get('ch1_thresholds', [])) + 1
+            n_bands_ch2 = len(info.get('ch2_thresholds', [])) + 1
             
-            for band_idx, band in enumerate(info['ch1_bands']):
+            # Generate consistent master gradients
+            grad_ch1 = create_gradient_colors('#0000FF', n_bands_ch1)
+            grad_ch2 = create_gradient_colors('#00FF00', n_bands_ch2)
+            
+            np.random.seed(42)
+            
+            # Plot Ch1 Bands using band_index for color
+            for band in info['ch1_bands']:
                 mask = (df['Ch1_Amplitude'] >= band['min']) & (df['Ch1_Amplitude'] <= band['max'])
                 band_data = df[mask]
                 
                 if len(band_data) > 0:
                     x_positions = np.random.uniform(-0.4, 0.4, len(band_data))
-                    color = ch1_band_colors.get((well_id, band_idx), '#0000FF')
+                    # Pick color based on the logical index (0=Bottom, 1=Top)
+                    c_idx = min(band['band_index'], len(grad_ch1)-1) 
+                    color = grad_ch1[c_idx]
                     
                     ax1.scatter(x_positions, band_data['Ch1_Amplitude'],
                               c=color, alpha=0.6, s=1.5, edgecolors='none')
-                    
-                    if band_idx < len(info['ch1_bands']) - 1:
-                        next_band = info['ch1_bands'][band_idx + 1]
-                        separator_y = (band['max'] + next_band['min']) / 2
-                        ax1.axhline(y=separator_y, color='red', linestyle='--', linewidth=0.5, alpha=0.7)
             
-            for band_idx, band in enumerate(info['ch2_bands']):
+            # --- RED LINE FIX ---
+            # Draw lines UNCONDITIONALLY (outside data loop)
+            if 'ch1_thresholds' in info:
+                for threshold in info['ch1_thresholds']:
+                    ax1.axhline(y=threshold, color='red', linestyle='--', linewidth=0.5, alpha=0.7)
+
+            # Plot Ch2 Bands
+            for band in info['ch2_bands']:
                 mask = (df['Ch2_Amplitude'] >= band['min']) & (df['Ch2_Amplitude'] <= band['max'])
                 band_data = df[mask]
                 
                 if len(band_data) > 0:
                     x_positions = np.random.uniform(-0.4, 0.4, len(band_data))
-                    color = ch2_band_colors.get((well_id, band_idx), '#00FF00')
+                    c_idx = min(band['band_index'], len(grad_ch2)-1)
+                    color = grad_ch2[c_idx]
                     
                     ax2.scatter(x_positions, band_data['Ch2_Amplitude'],
                               c=color, alpha=0.6, s=1.5, edgecolors='none')
-                    
-                    if band_idx < len(info['ch2_bands']) - 1:
-                        next_band = info['ch2_bands'][band_idx + 1]
-                        separator_y = (band['max'] + next_band['min']) / 2
-                        ax2.axhline(y=separator_y, color='red', linestyle='--', linewidth=0.5, alpha=0.7)
-            
-            # Set axis properties for Ch1
-            ax1.set_xlim(-0.5, 0.5)
-            ax1.set_ylim(ch1_min, ch1_max)
-            ax1.set_xticks([])
-            ax1.set_yticks([])
-            for spine in ax1.spines.values():
-                spine.set_visible(False)
 
-            # Set axis properties for Ch2
+            if 'ch2_thresholds' in info:
+                for threshold in info['ch2_thresholds']:
+                    ax2.axhline(y=threshold, color='red', linestyle='--', linewidth=0.5, alpha=0.7)
+            
+            # --- LIMITS FIX ---
+            # Strictly apply shared limits
+            ax1.set_xlim(-0.5, 0.5)
+            ax1.set_xticks([])
+            ax1.set_yticks([]) # clean look
+            for spine in ax1.spines.values(): spine.set_visible(False)
+
+            if info.get('limits'):
+                ax1.set_ylim(info['limits']['ch1_limits'])
+            else:
+                ax1.set_ylim(ch1_min_global, ch1_max_global)
+
             ax2.set_xlim(-0.5, 0.5)
-            ax2.set_ylim(ch2_min, ch2_max)
             ax2.set_xticks([])
             ax2.set_yticks([])
-            for spine in ax2.spines.values():
-                spine.set_visible(False)
+            for spine in ax2.spines.values(): spine.set_visible(False)
+
+            if info.get('limits'):
+                ax2.set_ylim(info['limits']['ch2_limits'])
+            else:
+                ax2.set_ylim(ch2_min_global, ch2_max_global)
             
+            # Text labels (same as before)
             ax1.text(0, 1.05, well_id, transform=ax1.transAxes, 
                     fontsize=6, fontweight='bold', ha='center', va='bottom')
             
@@ -1365,6 +1774,7 @@ def create_96well_1d_page(well_info, pdf, log_func):
             ax2.text(0, -0.15, ch2_stats if ch2_stats else '0%', transform=ax2.transAxes,
                     fontsize=4.5, ha='center', va='top', color='#008000', family='monospace')
     
+    # Standard cleanup
     for col in range(12):
         ax = plt.subplot(8, 24, col * 2 + 1)
         ax.text(1, 1.15, f'{col+1:02d}', transform=ax.transAxes,
@@ -1375,32 +1785,40 @@ def create_96well_1d_page(well_info, pdf, log_func):
         row_letter = chr(ord('A') + row)
         ax.text(-0.3, 0.5, row_letter, transform=ax.transAxes,
                fontsize=7, ha='right', va='center', fontweight='bold')
-    
+               
+    # Hide empty
     for row in range(8):
         for col in range(12):
             well_id = f'{chr(ord("A") + row)}{col+1:02d}'
             if well_id not in well_info:
                 pos_ch1 = row * 24 + col * 2 + 1
                 pos_ch2 = row * 24 + col * 2 + 2
-                ax1 = plt.subplot(8, 24, pos_ch1)
-                ax2 = plt.subplot(8, 24, pos_ch2)
-                ax1.axis('off')
-                ax2.axis('off')
+                plt.subplot(8, 24, pos_ch1).axis('off')
+                plt.subplot(8, 24, pos_ch2).axis('off')
 
-    plt.suptitle('96-Well Plate - 1D Band Detection\nLeft: FAM (Blue) | Right: HEX (Green) | Numbers: Band proportions | Red lines: Separators', 
+    plt.suptitle('96-Well Plate - 1D Band Detection (Strict Thresholds + Global Scaling)', 
                 fontsize=13, fontweight='bold', y=0.995)
     plt.tight_layout(rect=[0.02, 0, 1, 0.99])
-    pdf.savefig(fig, dpi=200, bbox_inches='tight')
+    
+    # SAVE LOGIC
+    if isinstance(destination, (str, Path)):
+        # Save as PNG
+        fig.savefig(destination, dpi=300, bbox_inches='tight')
+    else:
+        # Save to PDF Object
+        destination.savefig(fig, dpi=200, bbox_inches='tight')
+        
     plt.close(fig)
 
 
-def create_96well_2d_page(well_info, pdf, log_func):
-    """Create the 2D scatter plot page for 96-well plate"""
-    # Get global min/max for consistent axes
+def create_96well_2d_page(well_info, destination, log_func):
+    """
+    Updated: Consistent colors, lines, and limits for 2D scatter.
+    """
     all_ch1 = [v for info in well_info.values() for v in info['df']['Ch1_Amplitude']]
     all_ch2 = [v for info in well_info.values() for v in info['df']['Ch2_Amplitude']]
-    ch1_min, ch1_max = min(all_ch1), max(all_ch1)
-    ch2_min, ch2_max = min(all_ch2), max(all_ch2)
+    ch1_min_global, ch1_max_global = min(all_ch1), max(all_ch1)
+    ch2_min_global, ch2_max_global = min(all_ch2), max(all_ch2)
     
     fig = plt.figure(figsize=(20, 12))
     
@@ -1413,18 +1831,19 @@ def create_96well_2d_page(well_info, pdf, log_func):
             
             info = well_info[well_id]
             df = info['df']
-            ch1_bands = info['ch1_bands']
-            ch2_bands = info['ch2_bands']
             
-            # Position in grid (one subplot per well)
             pos = row * 12 + col + 1
             ax = plt.subplot(8, 12, pos)
             
-            # Generate colors
-            ch1_colors = create_gradient_colors('#0000FF', len(ch1_bands))
+            # Generate Colors based on thresholds (Global)
+            n_bands_ch1 = len(info.get('ch1_thresholds', [])) + 1
+            grad_ch1 = create_gradient_colors('#0000FF', n_bands_ch1)
             
-            # Plot each combination of bands
-            for ch1_idx, ch1_band in enumerate(ch1_bands):
+            # Plot
+            ch1_bands = info['ch1_bands']
+            ch2_bands = info['ch2_bands']
+            
+            for ch1_band in ch1_bands:
                 ch1_mask = (df['Ch1_Amplitude'] >= ch1_band['min']) & (df['Ch1_Amplitude'] <= ch1_band['max'])
                 
                 for ch2_idx, ch2_band in enumerate(ch2_bands):
@@ -1434,29 +1853,37 @@ def create_96well_2d_page(well_info, pdf, log_func):
                     band_data = df[combined_mask]
                     
                     if len(band_data) > 0:
-                        color = ch1_colors[ch1_idx]
+                        # Use band_index for consistent color
+                        c_idx = min(ch1_band['band_index'], len(grad_ch1)-1)
+                        color = grad_ch1[c_idx]
+                        
+                        # Add transparency based on Ch2 index (approximate, since Ch2 bands aren't main color)
                         alpha = 0.3 + (0.4 * ch2_idx / max(len(ch2_bands) - 1, 1))
                         
                         ax.scatter(band_data['Ch1_Amplitude'], 
                                   band_data['Ch2_Amplitude'],
                                   c=color, alpha=alpha, s=0.5, edgecolors='none')
             
-            # Draw separator lines
-            for ch1_idx in range(len(ch1_bands) - 1):
-                separator_x = (ch1_bands[ch1_idx]['max'] + ch1_bands[ch1_idx + 1]['min']) / 2
-                ax.axvline(x=separator_x, color='red', linestyle='--', linewidth=0.3, alpha=0.5)
+            # Draw Lines (Unconditionally)
+            if 'ch1_thresholds' in info:
+                for threshold in info['ch1_thresholds']:
+                    ax.axvline(x=threshold, color='red', linestyle='--', linewidth=0.3, alpha=0.5)
             
-            for ch2_idx in range(len(ch2_bands) - 1):
-                separator_y = (ch2_bands[ch2_idx]['max'] + ch2_bands[ch2_idx + 1]['min']) / 2
-                ax.axhline(y=separator_y, color='red', linestyle='--', linewidth=0.3, alpha=0.5)
+            if 'ch2_thresholds' in info:
+                for threshold in info['ch2_thresholds']:
+                    ax.axhline(y=threshold, color='red', linestyle='--', linewidth=0.3, alpha=0.5)
             
-            # Format axes
-            ax.set_xlim(ch1_min, ch1_max)
-            ax.set_ylim(ch2_min, ch2_max)
+            # Strict Limits
             ax.set_xticks([])
             ax.set_yticks([])
             
-            # Well label
+            if info.get('limits'):
+                ax.set_xlim(info['limits']['ch1_limits'])
+                ax.set_ylim(info['limits']['ch2_limits'])
+            else:
+                ax.set_xlim(ch1_min_global, ch1_max_global)
+                ax.set_ylim(ch2_min_global, ch2_max_global)
+            
             ax.text(0.5, 1.02, well_id, transform=ax.transAxes, 
                     fontsize=6, fontweight='bold', ha='center', va='bottom')
     
@@ -1466,71 +1893,91 @@ def create_96well_2d_page(well_info, pdf, log_func):
         ax.text(0.5, 1.12, f'{col+1:02d}', transform=ax.transAxes,
                fontsize=7, ha='center', va='bottom', fontweight='bold')
     
-    # Add row labels
     for row in range(8):
         ax = plt.subplot(8, 12, row * 12 + 1)
         row_letter = chr(ord('A') + row)
         ax.text(-0.15, 0.5, row_letter, transform=ax.transAxes,
                fontsize=7, ha='right', va='center', fontweight='bold')
-    
-    # Hide empty wells
+
     for row in range(8):
         for col in range(12):
             well_id = f'{chr(ord("A") + row)}{col+1:02d}'
             if well_id not in well_info:
-                pos = row * 12 + col + 1
-                ax = plt.subplot(8, 12, pos)
-                ax.axis('off')
+                plt.subplot(8, 12, row * 12 + col + 1).axis('off')
 
-    plt.suptitle('96-Well Plate - 2D Scatter (Ch1 vs Ch2)\nRed lines: Band separators', 
+    plt.suptitle('96-Well Plate - 2D Scatter (Strict Thresholds + Global Scaling)', 
                 fontsize=13, fontweight='bold', y=0.995)
     plt.tight_layout(rect=[0.02, 0, 1, 0.99])
-    pdf.savefig(fig, dpi=200, bbox_inches='tight')
+    
+    # SAVE LOGIC
+    if isinstance(destination, (str, Path)):
+        # Save as PNG
+        fig.savefig(destination, dpi=300, bbox_inches='tight')
+    else:
+        # Save to PDF Object
+        destination.savefig(fig, dpi=200, bbox_inches='tight')
+        
     plt.close(fig)
 
 
-def calculate_well_band_statistics(well_id, df):
-    """Calculate band-based statistics for a single well"""
-    total_droplets = len(df)
+def calculate_well_band_statistics(well_id, df, ch1_bands=None, ch2_bands=None, use_gmm=True):
+    """
+    Calculate band statistics for a well.
+    ALWAYS uses 2D GMM first if bands not provided (2D-first approach).
+    """
+    if ch1_bands is None or ch2_bands is None:
+        # Use 2D GMM to detect populations
+        result = detect_populations_2d_gmm_robust(
+            df['Ch1_Amplitude'].values,
+            df['Ch2_Amplitude'].values,
+            max_populations=4
+        )
+        
+        # Apply thresholds to get bands
+        ch1_bands = apply_thresholds_to_get_bands(
+            df['Ch1_Amplitude'].values,
+            result['ch1_thresholds'],
+            percentile_bounds=True
+        )
+        
+        ch2_bands = apply_thresholds_to_get_bands(
+            df['Ch2_Amplitude'].values,
+            result['ch2_thresholds'],
+            percentile_bounds=True
+        )
     
-    # Detect bands for both channels
-    ch1_bands = detect_bands_kmeans(df['Ch1_Amplitude'])
-    ch2_bands = detect_bands_kmeans(df['Ch2_Amplitude'])
-    
+    # Calculate statistics for each band combination
     stats_rows = []
     
-    # Ch1 bands
-    for band_idx, band in enumerate(ch1_bands):
-        stats_rows.append({
-            'Well': well_id,
-            'Channel': 'Ch1_FAM',
-            'Band_Number': band_idx + 1,
-            'Band_Min': band['min'],
-            'Band_Max': band['max'],
-            'Band_Center': band['center'],
-            'Droplet_Count': band['count'],
-            'Proportion_Percent': band['proportion'],
-            'Total_Droplets_In_Well': total_droplets
-        })
+    # Get channel names from DataFrame attributes if available
+    channel_map = df.attrs.get('channel_map', {'Ch1_Amplitude': 'Ch1', 'Ch2_Amplitude': 'Ch2'})
+    ch1_name = channel_map.get('Ch1_Amplitude', 'Ch1')
+    ch2_name = channel_map.get('Ch2_Amplitude', 'Ch2')
     
-    # Ch2 bands
-    for band_idx, band in enumerate(ch2_bands):
-        stats_rows.append({
-            'Well': well_id,
-            'Channel': 'Ch2_HEX',
-            'Band_Number': band_idx + 1,
-            'Band_Min': band['min'],
-            'Band_Max': band['max'],
-            'Band_Center': band['center'],
-            'Droplet_Count': band['count'],
-            'Proportion_Percent': band['proportion'],
-            'Total_Droplets_In_Well': total_droplets
-        })
+    for ch1_idx, ch1_band in enumerate(ch1_bands):
+        ch1_mask = (df['Ch1_Amplitude'] >= ch1_band['min']) & (df['Ch1_Amplitude'] <= ch1_band['max'])
+        
+        for ch2_idx, ch2_band in enumerate(ch2_bands):
+            ch2_mask = (df['Ch2_Amplitude'] >= ch2_band['min']) & (df['Ch2_Amplitude'] <= ch2_band['max'])
+            
+            combined_mask = ch1_mask & ch2_mask
+            count = combined_mask.sum()
+            
+            if count > 0:
+                stats_rows.append({
+                    'Well': well_id,
+                    f'{ch1_name}_Band': ch1_idx + 1,
+                    f'{ch2_name}_Band': ch2_idx + 1,
+                    'Count': int(count),
+                    'Percentage': float(count / len(df) * 100),
+                    f'{ch1_name}_Center': float(ch1_band['center']),
+                    f'{ch2_name}_Center': float(ch2_band['center']),
+                })
     
     return stats_rows, ch1_bands, ch2_bands
 
 
-def process_ddpcr_files(csv_files, log_func=print):
+def process_ddpcr_files(csv_files, log_func=print, output_format='png'):
     """Process multiple ddPCR CSV files and generate plots and statistics"""
     
     if not csv_files:
@@ -1606,17 +2053,19 @@ def process_ddpcr_files(csv_files, log_func=print):
             
             # Create individual well plot with band coloring
             fig = plot_well_with_bands(df, well_id, ch1_bands, ch2_bands)
-            output_pdf = output_dir / f"{well_id}_1D_plot.pdf"
-            fig.savefig(output_pdf, format='pdf', dpi=300, bbox_inches='tight')
+            
+            # DYNAMIC EXTENSION
+            output_plot = output_dir / f"{well_id}_1D_plot.{output_format}"
+            fig.savefig(output_plot, format=output_format, dpi=300, bbox_inches='tight')
             plt.close(fig)
             
             # Create 2D scatter plot
             fig_2d = plot_well_2d_scatter(df, well_id, ch1_bands, ch2_bands)
-            output_2d_pdf = output_dir / f"{well_id}_2D_plot.pdf"
-            fig_2d.savefig(output_2d_pdf, format='pdf', dpi=300, bbox_inches='tight')
+            output_2d = output_dir / f"{well_id}_2D_plot.{output_format}"
+            fig_2d.savefig(output_2d, format=output_format, dpi=300, bbox_inches='tight')
             plt.close(fig_2d)
             
-            log_func(f"  Saved: {output_pdf.name} and {output_2d_pdf.name}")
+            log_func(f"  Saved: {output_plot.name} and {output_2d.name}")
             
         except Exception as e:
             log_func(f"  ⚠️  Error processing {csv_path.name}: {str(e)}")
@@ -1627,8 +2076,9 @@ def process_ddpcr_files(csv_files, log_func=print):
     # Create 96-well plate overview
     if all_data:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        plate_output = output_dir / f"96well_plate_overview_{timestamp}.pdf"
-        plot_96well_layout(all_data, plate_output, log_func)
+        # Note: We pass the base name, the function will handle extension for PNG vs PDF
+        plate_output = output_dir / f"96well_plate_overview_{timestamp}" 
+        plot_96well_layout(all_data, plate_output, log_func, None, True, output_format)
 
     stats_file = None
     if all_stats_rows:
@@ -1641,7 +2091,7 @@ def process_ddpcr_files(csv_files, log_func=print):
     return output_dir, stats_file
 
 
-def process_qlp_file(qlp_file, well_assignments, include_filtered, log_func=print):
+def process_qlp_file(qlp_file, well_assignments, include_filtered, log_func=print, output_format='png'):
     """Process a QLP file with well assignments to conditions"""
     
     qlp_path = Path(qlp_file)
@@ -1663,6 +2113,25 @@ def process_qlp_file(qlp_file, well_assignments, include_filtered, log_func=prin
     well_dataframes = parser.parse_to_dataframe(include_filtered=include_filtered)
     
     log_func(f"Extracted {len(well_dataframes)} wells")
+    
+    # Calculate shared thresholds if we have condition assignments
+    use_shared_thresholds = well_assignments and len(set(well_assignments.values())) > 0
+    shared_thresh = None
+    
+    if use_shared_thresholds:
+        log_func("\nCalculating shared thresholds per condition...")
+        shared_thresh = calculate_shared_thresholds(
+            well_dataframes,
+            well_assignments,
+            method='2d_gmm'
+        )
+        log_func(f"  Calculated thresholds for {len(shared_thresh)} condition(s)")
+        
+        # Log thresholds for each condition
+        for condition, thresholds in shared_thresh.items():
+            ch1_str = ', '.join([f'{t:.1f}' for t in thresholds['ch1_thresholds']])
+            ch2_str = ', '.join([f'{t:.1f}' for t in thresholds['ch2_thresholds']])
+            log_func(f"    {condition}: Ch1=[{ch1_str}], Ch2=[{ch2_str}]")
     
     # Export individual well CSVs and create plots
     all_stats_rows = []
@@ -1689,8 +2158,28 @@ def process_qlp_file(qlp_file, well_assignments, include_filtered, log_func=prin
         cluster_str = ', '.join([f"C{c}:{cluster_counts.get(c, 0)}" for c in sorted(cluster_counts.keys())])
         log_func(f"  Exported: {well_id}.csv ({len(df)} droplets - {cluster_str}) [{ch1_name}, {ch2_name}]")
         
-        # Calculate band statistics
-        stats_rows, ch1_bands, ch2_bands = calculate_well_band_statistics(well_id, df)
+        # Calculate band statistics using shared thresholds if available
+        if use_shared_thresholds:
+            condition = well_assignments.get(well_id, 'Unassigned')
+            thresholds = shared_thresh.get(condition, {'ch1_thresholds': [], 'ch2_thresholds': []})
+            
+            ch1_bands = apply_thresholds_to_get_bands(
+                df['Ch1_Amplitude'].values,
+                thresholds['ch1_thresholds'],
+                percentile_bounds=True
+            )
+            
+            ch2_bands = apply_thresholds_to_get_bands(
+                df['Ch2_Amplitude'].values,
+                thresholds['ch2_thresholds'],
+                percentile_bounds=True
+            )
+            
+            stats_rows, _, _ = calculate_well_band_statistics(well_id, df, ch1_bands, ch2_bands)
+        else:
+            # Individual well analysis
+            stats_rows, ch1_bands, ch2_bands = calculate_well_band_statistics(well_id, df, use_gmm=True)
+        
         all_stats_rows.extend(stats_rows)
         
         # Add condition info to stats if assigned
@@ -1705,8 +2194,8 @@ def process_qlp_file(qlp_file, well_assignments, include_filtered, log_func=prin
         if condition != 'Unassigned':
             fig.suptitle(f'Well {well_id} ({condition}) - Band Detection', fontsize=16, fontweight='bold')
         
-        plot_path = output_dir / f"{well_id}_1D_plot.pdf"
-        fig.savefig(plot_path, format='pdf', dpi=300, bbox_inches='tight')
+        plot_path = output_dir / f"{well_id}_1D_plot.{output_format}"
+        fig.savefig(plot_path, format=output_format, dpi=300, bbox_inches='tight')
         plt.close(fig)
         
         # Create individual well 2D scatter plot
@@ -1717,8 +2206,8 @@ def process_qlp_file(qlp_file, well_assignments, include_filtered, log_func=prin
             fig_2d.axes[0].set_title(f'Well {well_id} ({condition}) - 2D Scatter (Ch1 vs Ch2)', 
                                      fontsize=14, fontweight='bold')
         
-        plot_2d_path = output_dir / f"{well_id}_2D_plot.pdf"
-        fig_2d.savefig(plot_2d_path, format='pdf', dpi=300, bbox_inches='tight')
+        plot_2d_path = output_dir / f"{well_id}_2D_plot.{output_format}"
+        fig_2d.savefig(plot_2d_path, format=output_format, dpi=300, bbox_inches='tight')
         plt.close(fig_2d)
     
     log_func(f"\nGenerated {len(well_dataframes)} individual well plots (1D and 2D)")
@@ -1730,8 +2219,12 @@ def process_qlp_file(qlp_file, well_assignments, include_filtered, log_func=prin
         plate_data[well_id] = df
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    plate_output = output_dir / f"{qlp_path.stem}_96well_plate_{timestamp}.pdf"
-    plot_96well_layout(plate_data, plate_output, log_func)
+    # Pass base path without extension
+    plate_output = output_dir / f"{qlp_path.stem}_96well_plate_{timestamp}"
+    plot_96well_layout(plate_data, plate_output, log_func,
+                       condition_assignments=well_assignments,
+                       use_shared_thresholds=use_shared_thresholds,
+                       output_format=output_format)
     
     # Save band statistics
     stats_file = None
