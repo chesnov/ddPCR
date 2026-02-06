@@ -63,6 +63,8 @@ plots/
 
 > ⚠️ **WARNING**: This is from reverse-engineering. It's **INCOMPLETE** and **MAY BE WRONG**. Bio-Rad hasn't documented this format.
 
+> ✅ **UPDATE**: Well ID extraction is now **reliable** - we discovered they're at a fixed offset (+10) in each IFD header, not scattered through the file. This eliminates previous ordering assumptions.
+
 ### Structure
 ```
 QLP File = TIFF-like structure with custom tags
@@ -72,18 +74,44 @@ QLP File = TIFF-like structure with custom tags
 
 ### What Works ✅
 
-#### 1. Well IDs: `02 01 [A-H][01-12]\x00`
+#### 1. Well IDs: Direct Read from IFD Structure
 ```
-Hex: 02 01 43 30 33 00
-     └─┬─┘ └──┬──┘
-       │      └─ "C03"
-       └─ marker (WHY? unknown)
+IFD Header Pattern (each well block):
+Offset: +0  +2      +6          +10        +14
+        1C 00 FB FD 02 00 01 00 00 00 [WELL_ID]\x00 ED FD
+        ││││  │││││                    └─────┬─────┘
+        ││││  │││││                          │
+        ││││  │││││                     "C03", "D04", etc.
+        ││││  │││││
+        ││││  │││││ (This is Tag 65531/0xFDFB entry)
+        ││││  ││││└─ Tag 65533 (0xFDFD) follows
+        ││││  │││└── Count: 1
+        ││││  ││└─── Type: 2 (ASCII)
+        ││││  │└──── Tag ID: FB FD (little-endian)
+        ││││  └───── (part of tag structure)
+        │││└──────── Number of tag entries (0x1C = 28)
+        └─────────── IFD marker
 ```
-- Search file for this pattern
-- Extract all well IDs
-- Assign sequentially to data IFDs
 
-**Unknown**: Why `02 01`? Is this universal?
+**How it works:**
+- Well ID is **embedded in IFD header** at fixed offset +10
+- Read 4 bytes: `[Row][Col1][Col2]\x00` (e.g., "C03\x00")
+- No pattern matching needed - just read directly!
+- Row = A-H, Col = 01-12
+
+**Why this is reliable:**
+- Fixed position in structured data (not floating in binary)
+- No false positives from data sections
+- No dependency on file ordering
+- Works even with empty wells (cluster_size = 0)
+
+**Implementation:**
+```python
+well_id_offset = ifd_offset + 10
+well_id_bytes = data[well_id_offset:well_id_offset+4]
+well_id = well_id_bytes.split(b'\x00')[0].decode('ascii')
+# Returns: "C03", "D04", etc.
+```
 
 #### 2. Channel Names: `[zeros] "Unknown\x00" [+32] [Name]`
 ```
@@ -132,24 +160,25 @@ Hex: 02 01 43 30 33 00
    - Tag 65004: Always "Ch1,Ch2"
    - Unknown pattern: Actual names
 
-2. **Sequential assignment**
-   - Assumes well IDs & IFDs same order
-   - Is this always true?
+2. **Droplet record fields**
+   - 16 bytes unknown per droplet (out of 28 total)
 
-3. **Droplet record fields**
-   - 16 bytes unknown per droplet
-
-4. **Quality metrics**
+3. **Quality metrics**
    - Multiple tags, meanings unclear
+
+4. **Empty wells**
+   - Files contain IFDs for ALL 96 wells
+   - Most have cluster_size = 0 (no data)
+   - Why include them?
 
 ---
 
 ## Limitations
 
-1. **Assumes IFD order = well ID order**
-2. **Only 2 channels** (no multiplex)
-3. **Pattern-based** (may break on new versions)
-4. **No validation** (no checksums)
+1. **Only 2 channels** (no multiplex support yet)
+2. **Channel name extraction is heuristic** (Unknown+32 pattern)
+3. **No validation** (no checksums or error detection)
+4. **Partial droplet record** (only Ch1/Ch2 amplitudes decoded)
 
 ---
 

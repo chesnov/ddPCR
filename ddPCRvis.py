@@ -75,7 +75,8 @@ except ImportError:
 
 
 class BioRadQLPParser:
-    """Comprehensive parser for BioRad .QLP binary files - extracts ALL droplet data"""
+    """Minimal robust parser - reads well IDs directly from IFD data"""
+    
     def __init__(self, filepath, debug=False):
         self.filepath = filepath
         self.debug = debug
@@ -90,53 +91,28 @@ class BioRadQLPParser:
         self.RECORD_FMT = "I fff fff"
         
         # Tag IDs
-        self.TAG_WELL_NAME = 65019  # Contains only row letter (A-H)
-        self.TAG_WELL_ID = 65018     # Contains complete well ID (A01-H12)
-        self.TAG_CHANNEL_NAMES = 65004  # Contains channel names (Ch1,Ch2)
+        self.TAG_WELL_NAME = 65019
         self.TAG_DATA_START = 65021
         self.TAG_CLUSTER_ARRAY = 65057
-        self.TAG_QUALITY_ARRAY = 65054  # Quality flags per droplet
-        self.TAG_WELL_QUALITY = 65005   # Per-well quality (0.0 or 600.0)
-        self.TAG_QUALITY_SCORE = 65065  # Per-well quality score (0.0-1.0)
-        self.TAG_QUALITY_THRESHOLD = 65078  # Quality threshold (0.85)
+        self.TAG_QUALITY_ARRAY = 65054
+        self.TAG_WELL_QUALITY = 65005
+        self.TAG_CHANNEL_NAMES = 65004
         self.TAG_SOFTWARE = 305
         
-        # Channel names (parsed from file)
         self.channel_names = None
         
-        # Cluster mapping
         self.CLUSTER_BYTE_MAP = {
-            0x00: 0,  # Filtered/Invalid
-            0x11: 1,  # Cluster 1
-            0x22: 2,  # Cluster 2
-            0x33: 3,  # Cluster 3
-            0x44: 4,  # Cluster 4
+            0x00: 0, 0x11: 1, 0x22: 2, 0x33: 3, 0x44: 4
         }
         
         self.metadata = {}
-        self.well_metadata = {}  # Per-well metadata
-        
-        # Find all valid well IDs at initialization
-        self._find_valid_well_ids()
-    
-    def _find_valid_well_ids(self):
-        """Find all valid well IDs in the file using the 02 01 pattern"""
-        pattern = re.compile(rb'\x02\x01([A-H])(0[1-9]|1[0-2])\x00')
-        
-        self.valid_well_ids = []
-        for match in pattern.finditer(self.data):
-            row = match.group(1).decode('ascii')
-            col = match.group(2).decode('ascii')
-            well_id = f"{row}{col}"
-            self.valid_well_ids.append(well_id)
-        
-        if self.debug:
-            print(f"\nFound {len(self.valid_well_ids)} valid well IDs: {self.valid_well_ids}")
+        self.well_metadata = {}
 
     def _get_val(self, offset, fmt):
         try:
-            return struct.unpack(f"{self.endian}{fmt}", self.data[offset:offset+struct.calcsize(fmt)])[0]
-        except: 
+            return struct.unpack(f"{self.endian}{fmt}", 
+                               self.data[offset:offset+struct.calcsize(fmt)])[0]
+        except:
             return None
     
     def _extract_tags(self, ifd_offset):
@@ -144,222 +120,150 @@ class BioRadQLPParser:
         num_entries = self._get_val(ifd_offset, "H")
         tags = {}
         
+        if num_entries is None:
+            return tags
+            
         for i in range(num_entries):
             entry_ptr = ifd_offset + 2 + (i * 12)
             tid = self._get_val(entry_ptr, "H")
             ttype = self._get_val(entry_ptr + 2, "H")
             count = self._get_val(entry_ptr + 4, "I")
-            size = {1:1, 2:1, 3:2, 4:4, 5:8, 7:1, 9:4, 11:4, 12:8}.get(ttype, 1) * count
-            ptr = entry_ptr + 8 if size <= 4 else self._get_val(entry_ptr + 8, "I")
-            tags[tid] = (ptr, size, ttype, count)
+            
+            type_sizes = {1:1, 2:1, 3:2, 4:4, 5:8, 7:1, 9:4, 11:4, 12:8}
+            item_size = type_sizes.get(ttype, 1)
+            total_size = item_size * count
+            
+            val_or_offset = self._get_val(entry_ptr + 8, "I")
+            ptr = entry_ptr + 8 if total_size <= 4 else val_or_offset
+            
+            tags[tid] = (ptr, total_size, ttype, count)
         
         return tags
-    
+
+    def _read_well_id_from_ifd(self, ifd_offset):
+        """
+        Read well ID directly from IFD data.
+        Pattern: IFD starts with: 1c 00 fb fd 02 00 01 00 00 00 [WELL_ID]\x00
+        Well ID is at offset +10 from IFD start (e.g., "C03", "D04")
+        """
+        # Read 4 bytes starting at offset +10
+        well_id_offset = ifd_offset + 10
+        well_id_bytes = self.data[well_id_offset:well_id_offset+4]
+        
+        # Parse as null-terminated string
+        try:
+            well_id = well_id_bytes.split(b'\x00')[0].decode('ascii')
+            # Validate format: [A-H][0-9][0-9]
+            if len(well_id) == 3 and well_id[0] in 'ABCDEFGH' and well_id[1:].isdigit():
+                return well_id
+        except:
+            pass
+        
+        return None
+
     def _extract_metadata(self):
         """Extract file metadata"""
         ifd_offset = self._get_val(4, "I")
+        if not ifd_offset:
+            return
+
         tags = self._extract_tags(ifd_offset)
         
         if self.TAG_SOFTWARE in tags:
             ptr, size, _, _ = tags[self.TAG_SOFTWARE]
-            try:
-                value = self.data[ptr:ptr+size].decode('ascii', errors='ignore').split('\x00')[0].strip()
-                self.metadata['software'] = value
-            except:
-                pass
+            if ptr and size:
+                self.metadata['software'] = self.data[ptr:ptr+size].decode('ascii', errors='ignore').split('\x00')[0]
         
-        # Try to extract channel names from Tag 65004 first
         if self.TAG_CHANNEL_NAMES in tags:
             ptr, size, _, _ = tags[self.TAG_CHANNEL_NAMES]
-            try:
-                channel_str = self.data[ptr:ptr+size].decode('ascii', errors='ignore').rstrip('\x00')
+            if ptr and size:
+                channel_str = self.data[ptr:ptr+size].decode('ascii', errors='ignore').split('\x00')[0]
                 self.channel_names = [ch.strip() for ch in channel_str.split(',')]
-                self.metadata['channel_names'] = self.channel_names
-                if self.debug:
-                    print(f"Found channel names from Tag 65004: {self.channel_names}")
-            except:
-                pass
         
-        # If Tag 65004 didn't work or gave generic names, try the "Unknown" pattern
-        if self.channel_names is None or self.channel_names == ['Ch1', 'Ch2']:
-            self._extract_channel_names_from_unknown_pattern()
-        
-        # Fallback to default channel names if not found
-        if self.channel_names is None:
+        if not self.channel_names:
             self.channel_names = ['Ch1', 'Ch2']
-            if self.debug:
-                print(f"Using default channel names: {self.channel_names}")
-    
-    def _extract_channel_names_from_unknown_pattern(self):
-        """
-        Extract channel names using the Unknown + 32 bytes pattern.
-        Structure: [padding] "Unknown" [padding] [channel_name]
-        """
-        channels_found = []
-        idx = 0
-        
-        while idx < len(self.data):
-            idx = self.data.find(b'Unknown\x00', idx)
-            if idx == -1:
-                break
-            
-            # Check if preceded by zeros (padding)
-            if idx >= 32:
-                preceding = self.data[idx-32:idx]
-                if preceding.count(b'\x00') >= 28:  # Mostly zeros
-                    # Channel name is 32 bytes after "Unknown\x00" (8 bytes)
-                    channel_name_offset = idx + 32
-                    channel_data = self.data[channel_name_offset:channel_name_offset+64]
-                    
-                    # Find null terminator
-                    null_pos = channel_data.find(b'\x00')
-                    if null_pos > 0:
-                        channel_name = channel_data[:null_pos].decode('ascii', errors='ignore')
-                        
-                        # Validate it's a reasonable channel name
-                        if len(channel_name) >= 2 and channel_name.isprintable() and channel_name != 'Unknown':
-                            channels_found.append(channel_name)
-                            if self.debug:
-                                print(f"Found channel '{channel_name}' at offset {channel_name_offset}")
-            
-            idx += 1
-        
-        # Use first two unique channels
-        unique_channels = []
-        seen = set()
-        for name in channels_found:
-            if name not in seen:
-                unique_channels.append(name)
-                seen.add(name)
-                if len(unique_channels) >= 2:
-                    break
-        
-        if len(unique_channels) >= 1:
-            if self.channel_names is None:
-                self.channel_names = ['Ch1', 'Ch2']
-            self.channel_names[0] = unique_channels[0]
-            self.metadata['channel_1_name'] = unique_channels[0]
-            
-        if len(unique_channels) >= 2:
-            self.channel_names[1] = unique_channels[1]
-            self.metadata['channel_2_name'] = unique_channels[1]
-        
-        if self.debug and unique_channels:
-            print(f"Extracted channel names from Unknown pattern: {self.channel_names}")
 
     def parse_to_dataframe(self, include_filtered=True):
-        """
-        Parse QLP file and return dict of well_id -> DataFrame
-        
-        Args:
-            include_filtered: If True, include droplets with cluster=0 (default: True)
-        """
+        """Parse QLP file and return dict of well_id -> DataFrame"""
         self._extract_metadata()
         
         ifd_offset = self._get_val(4, "I")
         well_data = defaultdict(list)
-        well_index = 0  # Index into self.valid_well_ids list
 
-        while ifd_offset != 0 and ifd_offset < len(self.data):
+        while ifd_offset and ifd_offset < len(self.data):
             tags = self._extract_tags(ifd_offset)
             num_entries = self._get_val(ifd_offset, "H")
             
-            # Only process IFDs with well name, data, and cluster arrays
+            if not num_entries:
+                break
+
+            # Check if this is a well block
             if (self.TAG_WELL_NAME in tags and 
                 self.TAG_DATA_START in tags and 
                 self.TAG_CLUSTER_ARRAY in tags):
                 
-                # Assign the next valid well ID in sequential order
-                if well_index < len(self.valid_well_ids):
-                    well_id = self.valid_well_ids[well_index]
-                    well_index += 1
-                else:
-                    # No more valid well IDs - skip this IFD
+                cluster_size = tags[self.TAG_CLUSTER_ARRAY][1]
+                
+                # Skip empty wells
+                if cluster_size == 0:
+                    ifd_offset = self._get_val(ifd_offset + 2 + (num_entries * 12), "I")
+                    continue
+                
+                # Read well ID directly from IFD
+                well_id = self._read_well_id_from_ifd(ifd_offset)
+                
+                if not well_id:
                     if self.debug:
-                        print(f"  Skipping IFD at {ifd_offset} - no more well IDs")
+                        print(f"Warning: Could not read well ID at IFD offset 0x{ifd_offset:08x}")
                     ifd_offset = self._get_val(ifd_offset + 2 + (num_entries * 12), "I")
                     continue
                 
                 if self.debug:
-                    print(f"Processing well: {well_id}")
+                    print(f"Well {well_id}: {cluster_size} droplets")
                 
-                # Extract per-well metadata
+                # Extract well metadata
                 well_meta = {}
-                
                 if self.TAG_WELL_QUALITY in tags:
-                    ptr, _, _, _ = tags[self.TAG_WELL_QUALITY]
+                    ptr = tags[self.TAG_WELL_QUALITY][0]
                     well_meta['well_quality_flag'] = self._get_val(ptr, 'f')
-                
-                if self.TAG_QUALITY_SCORE in tags:
-                    ptr, _, _, _ = tags[self.TAG_QUALITY_SCORE]
-                    well_meta['well_quality_score'] = self._get_val(ptr, 'f')
-                
-                if self.TAG_QUALITY_THRESHOLD in tags:
-                    ptr, _, _, _ = tags[self.TAG_QUALITY_THRESHOLD]
-                    well_meta['quality_threshold'] = self._get_val(ptr, 'f')
                 
                 self.well_metadata[well_id] = well_meta
                 
-                # Read cluster array
-                tag_info = tags[self.TAG_CLUSTER_ARRAY]
-                cluster_array_size = tag_info[1]
+                # Read droplet data
+                cluster_array = self.data[tags[self.TAG_CLUSTER_ARRAY][0]:
+                                         tags[self.TAG_CLUSTER_ARRAY][0]+cluster_size]
                 
-                # Skip wells with empty cluster arrays
-                if cluster_array_size == 0:
-                    ifd_offset = self._get_val(ifd_offset + 2 + (num_entries * 12), "I")
-                    continue
-                
-                cluster_array = self.data[tag_info[0]:tag_info[0]+cluster_array_size]
-                
-                # Read quality flag array (Tag 65054) if present
                 quality_array = None
                 if self.TAG_QUALITY_ARRAY in tags:
-                    tag_info = tags[self.TAG_QUALITY_ARRAY]
-                    if tag_info[1] > 0:
-                        quality_array = self.data[tag_info[0]:tag_info[0]+tag_info[1]]
+                    q_ptr, q_size = tags[self.TAG_QUALITY_ARRAY][0], tags[self.TAG_QUALITY_ARRAY][1]
+                    if q_size > 0:
+                        quality_array = self.data[q_ptr:q_ptr+q_size]
                 
-                # Read droplet data
                 cursor = tags[self.TAG_DATA_START][0]
                 droplet_idx = 0
                 
                 while cursor < len(self.data) - self.RECORD_SIZE and droplet_idx < len(cluster_array):
-                    # Parse complete 28-byte record
                     r = struct.unpack(f"{self.endian}{self.RECORD_FMT}", 
                                      self.data[cursor:cursor+self.RECORD_SIZE])
                     
-                    # Get cluster assignment
-                    cluster_byte = cluster_array[droplet_idx]
-                    cluster = self.CLUSTER_BYTE_MAP.get(cluster_byte, 0)
+                    cluster = self.CLUSTER_BYTE_MAP.get(cluster_array[droplet_idx], 0)
+                    quality_flag = quality_array[droplet_idx] if quality_array and droplet_idx < len(quality_array) else 0
                     
-                    # Get quality flag if available
-                    quality_flag = None
-                    if quality_array and droplet_idx < len(quality_array):
-                        quality_flag = quality_array[droplet_idx]
-                    
-                    # Include ALL droplets or filter based on parameter
                     if include_filtered or cluster > 0:
                         droplet = {
                             'DropletID': r[0],
                             'Ch1_Amplitude': r[1],
                             'Ch2_Amplitude': r[4],
                             'Cluster': cluster,
-                            'Cluster_Byte': cluster_byte,
-                            'Quality_Flag': quality_flag if quality_flag is not None else 0,
-                            'Field_2': r[2],
-                            'Field_3': r[3],
-                            'Field_5': r[5],
-                            'Field_6': r[6],
+                            'Quality_Flag': quality_flag,
                         }
-                        
-                        # Add well metadata to each droplet
-                        for key, value in well_meta.items():
-                            droplet[key] = value
-                        
+                        droplet.update(well_meta)
                         well_data[well_id].append(droplet)
                     
                     droplet_idx += 1
                     cursor += self.RECORD_SIZE
 
+            # Move to next IFD
             ifd_offset = self._get_val(ifd_offset + 2 + (num_entries * 12), "I")
 
         # Convert to DataFrames
@@ -367,21 +271,19 @@ class BioRadQLPParser:
         for well_id, data in well_data.items():
             if data:
                 df = pd.DataFrame(data)
-                # Store channel names as DataFrame attribute for reference
-                df.attrs['channel_names'] = self.channel_names if self.channel_names else ['Ch1', 'Ch2']
+                df.attrs['channel_names'] = self.channel_names
                 df.attrs['channel_map'] = {
-                    'Ch1_Amplitude': self.channel_names[0] if self.channel_names and len(self.channel_names) > 0 else 'Ch1',
-                    'Ch2_Amplitude': self.channel_names[1] if self.channel_names and len(self.channel_names) > 1 else 'Ch2'
+                    'Ch1_Amplitude': self.channel_names[0],
+                    'Ch2_Amplitude': self.channel_names[1]
                 }
                 well_dataframes[well_id] = df
         
         return well_dataframes
 
     def get_channel_names(self):
-        """Return the channel names parsed from the file"""
         if self.channel_names is None:
             self._extract_metadata()
-        return self.channel_names if self.channel_names else ['Ch1', 'Ch2']
+        return self.channel_names or ['Ch1', 'Ch2']
 
 
 class WellAssignmentDialog(QDialog):
