@@ -995,6 +995,29 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Error", error_message)
 
 
+def format_population_stats(count, total):
+    """
+    Format count and percentage with scientific notation for rare events.
+    Format: "Count (Percentage%)"
+    Example: "1250 (12.5%)" or "3 (2.5e-3%)"
+    """
+    if total == 0:
+        return "0 (0%)"
+    
+    pct = (count / total) * 100
+    
+    if count == 0:
+        pct_str = "0%"
+    elif pct < 0.01:
+        # Scientific notation for very small percentages
+        # e.g. 1.5e-04%
+        pct_str = f"{pct:.1e}%"
+    else:
+        # Standard fixed point for normal percentages
+        pct_str = f"{pct:.1f}%"
+        
+    return f"{count} ({pct_str})"
+
 def get_density_based_thresholds(values, min_separation=500, rain_sensitivity=0.1):
     """
     Revised V3: Log-Space Peak Detection.
@@ -1091,21 +1114,19 @@ def get_density_based_thresholds(values, min_separation=500, rain_sensitivity=0.
 
 
 def plot_well_2d_scatter(df, well_id, ch1_bands, ch2_bands):
-    """Create 2D scatter plot for Ch1 vs Ch2 with band coloring"""
+    """
+    Create 2D scatter plot for Ch1 vs Ch2 with detailed stats in legend.
+    """
     fig, ax = plt.subplots(1, 1, figsize=(8, 8))
     
-    # Get actual channel names from DataFrame attributes
     channel_map = df.attrs.get('channel_map', {'Ch1_Amplitude': 'Ch1', 'Ch2_Amplitude': 'Ch2'})
     ch1_name = channel_map.get('Ch1_Amplitude', 'Ch1')
     ch2_name = channel_map.get('Ch2_Amplitude', 'Ch2')
     
-    # Generate gradient colors for bands
     ch1_colors = create_gradient_colors('#0000FF', len(ch1_bands))
     ch2_colors = create_gradient_colors('#00FF00', len(ch2_bands))
     
-    # Create a color map based on which band each droplet belongs to
-    # We'll color by Ch1 band primarily, with some transparency
-    np.random.seed(42)
+    total_droplets = len(df)
     
     # Plot each combination of Ch1 and Ch2 bands
     for ch1_idx, ch1_band in enumerate(ch1_bands):
@@ -1114,39 +1135,66 @@ def plot_well_2d_scatter(df, well_id, ch1_bands, ch2_bands):
         for ch2_idx, ch2_band in enumerate(ch2_bands):
             ch2_mask = (df['Ch2_Amplitude'] >= ch2_band['min']) & (df['Ch2_Amplitude'] <= ch2_band['max'])
             
-            # Get droplets in both bands
             combined_mask = ch1_mask & ch2_mask
             band_data = df[combined_mask]
             
-            if len(band_data) > 0:
-                # Mix colors based on both channels
-                # Use Ch1 color with varying intensity based on Ch2
+            count = len(band_data)
+            # Always plot/label if valid combination, even if count is 0 (though loop logic usually prevents 0)
+            if count >= 0: 
+                # Determine Color
                 color = ch1_colors[ch1_idx]
                 alpha = 0.3 + (0.4 * ch2_idx / max(len(ch2_bands) - 1, 1))
                 
-                ax.scatter(band_data['Ch1_Amplitude'], 
-                          band_data['Ch2_Amplitude'],
-                          c=color, alpha=alpha, s=5, edgecolors='none',
-                          label=f'{ch1_name}-B{ch1_idx+1} × {ch2_name}-B{ch2_idx+1}' if ch1_idx < 2 and ch2_idx < 2 else '')
-    
-    # Draw separator lines for bands
+                # Format Label with Stats
+                stats_str = format_population_stats(count, total_droplets)
+                
+                # Determine Population Name for Legend
+                # Logic: 0=Neg, >0=Pos
+                if ch1_idx == 0 and ch2_idx == 0:
+                    pop_name = "Neg/Neg"
+                elif ch1_idx > 0 and ch2_idx == 0:
+                    pop_name = f"{ch1_name}+"
+                elif ch1_idx == 0 and ch2_idx > 0:
+                    pop_name = f"{ch2_name}+"
+                elif ch1_idx > 0 and ch2_idx > 0:
+                    pop_name = "Double+"
+                else:
+                    pop_name = f"B{ch1_idx}/B{ch2_idx}"
+                
+                label_text = f"{pop_name}: {stats_str}"
+
+                if count > 0:
+                    ax.scatter(band_data['Ch1_Amplitude'], 
+                              band_data['Ch2_Amplitude'],
+                              c=color, alpha=alpha, s=5, edgecolors='none',
+                              label=label_text)
+                else:
+                    # Plot ghost point for legend entry
+                    ax.scatter([], [], c=color, label=label_text)
+
+    # Draw separators
     for ch1_idx in range(len(ch1_bands) - 1):
-        separator_x = (ch1_bands[ch1_idx]['max'] + ch1_bands[ch1_idx + 1]['min']) / 2
-        ax.axvline(x=separator_x, color='red', linestyle='--', linewidth=1, alpha=0.5)
+        # Use existing thresholds if available in band dict, else midpoint
+        if ch1_bands[ch1_idx].get('threshold_upper'):
+            sep = ch1_bands[ch1_idx]['threshold_upper']
+        else:
+            sep = (ch1_bands[ch1_idx]['max'] + ch1_bands[ch1_idx + 1]['min']) / 2
+        ax.axvline(x=sep, color='red', linestyle='--', linewidth=1, alpha=0.5)
     
     for ch2_idx in range(len(ch2_bands) - 1):
-        separator_y = (ch2_bands[ch2_idx]['max'] + ch2_bands[ch2_idx + 1]['min']) / 2
-        ax.axhline(y=separator_y, color='red', linestyle='--', linewidth=1, alpha=0.5)
+        if ch2_bands[ch2_idx].get('threshold_upper'):
+            sep = ch2_bands[ch2_idx]['threshold_upper']
+        else:
+            sep = (ch2_bands[ch2_idx]['max'] + ch2_bands[ch2_idx + 1]['min']) / 2
+        ax.axhline(y=sep, color='red', linestyle='--', linewidth=1, alpha=0.5)
     
     ax.set_xlabel(f'{ch1_name} Amplitude', fontsize=12, fontweight='bold')
     ax.set_ylabel(f'{ch2_name} Amplitude', fontsize=12, fontweight='bold')
     ax.set_title(f'Well {well_id} - 2D Scatter ({ch1_name} vs {ch2_name})', fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.2)
     
-    # Add band count annotation
-    ax.text(0.02, 0.98, f'{ch1_name}: {len(ch1_bands)} bands\n{ch2_name}: {len(ch2_bands)} bands', 
-            transform=ax.transAxes, fontsize=10, verticalalignment='top',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    # Place Legend outside if too many items, or best location
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize=10)
     
     plt.tight_layout()
     return fig
@@ -1154,16 +1202,21 @@ def plot_well_2d_scatter(df, well_id, ch1_bands, ch2_bands):
 
 def plot_well_with_bands(df, well_id, ch1_bands, ch2_bands, limits=None):
     """
-    Updated to accept 'limits' dictionary for synchronized axes.
+    Create band-colored 1D amplitude plot with proper axis limits and threshold lines.
+    UPDATED: Legends now use scientific notation for percentages via format_population_stats.
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     
+    # Get actual channel names
     channel_map = df.attrs.get('channel_map', {'Ch1_Amplitude': 'Ch1', 'Ch2_Amplitude': 'Ch2'})
     ch1_name = channel_map.get('Ch1_Amplitude', 'Ch1')
     ch2_name = channel_map.get('Ch2_Amplitude', 'Ch2')
     
+    # Generate gradient colors
     ch1_colors = create_gradient_colors('#0000FF', len(ch1_bands))
     ch2_colors = create_gradient_colors('#00FF00', len(ch2_bands))
+    
+    total_droplets = len(df)
     
     # Set Limits
     if limits and 'ch1_limits' in limits:
@@ -1173,48 +1226,74 @@ def plot_well_with_bands(df, well_id, ch1_bands, ch2_bands, limits=None):
         # Fallback to local scaling
         ch1_all = df['Ch1_Amplitude'].values
         ch2_all = df['Ch2_Amplitude'].values
-        ylim_ch1 = (ch1_all.min() * 0.95, ch1_all.max() * 1.05)
-        ylim_ch2 = (ch2_all.min() * 0.95, ch2_all.max() * 1.05)
+        ylim_ch1 = (ch1_all.min() * 0.95, ch1_all.max() * 1.05) if len(ch1_all) > 0 else (0, 10000)
+        ylim_ch2 = (ch2_all.min() * 0.95, ch2_all.max() * 1.05) if len(ch2_all) > 0 else (0, 10000)
     
-    # Plot Ch1
+    # --- Plot Ch1 with bands ---
     for band_idx, band in enumerate(ch1_bands):
         mask = (df['Ch1_Amplitude'] >= band['min']) & (df['Ch1_Amplitude'] <= band['max'])
         band_data = df[mask]
+        
         if len(band_data) > 0:
             x_jitter = np.random.uniform(-0.3, 0.3, len(band_data))
-            ax1.scatter(x_jitter, band_data['Ch1_Amplitude'], 
-                       c=ch1_colors[band_idx], alpha=0.6, s=10)
             
-            # Plot Threshold (Upper bound of band, if it acts as a separator)
+            # Format label using the helper function
+            stats_str = format_population_stats(band["count"], total_droplets)
+            label_text = f'Pop {band_idx+1}: {stats_str}'
+            
+            ax1.scatter(x_jitter, band_data['Ch1_Amplitude'], 
+                       c=ch1_colors[band_idx], alpha=0.6, s=10,
+                       label=label_text)
+            
+            # Draw threshold line
             if band['threshold_upper'] is not None:
-                ax1.axhline(y=band['threshold_upper'], color='red', linestyle='--', linewidth=1.5)
-
+                ax1.axhline(y=band['threshold_upper'], color='red', linestyle='--', 
+                           linewidth=2, alpha=0.8)
+    
     ax1.set_ylabel(f'{ch1_name} Amplitude', fontsize=12, fontweight='bold')
     ax1.set_xlim(-0.5, 0.5)
-    ax1.set_ylim(ylim_ch1) # Apply explicit limits
+    ax1.set_ylim(ylim_ch1)
     ax1.set_xticks([])
-    ax1.set_title(f'{ch1_name}', fontsize=14, fontweight='bold')
+    ax1.set_title(f'{ch1_name} ({len(ch1_bands)} populations)', fontsize=14, fontweight='bold')
+    if ch1_bands:
+        ax1.legend(loc='best', fontsize=9, framealpha=0.9)
     ax1.grid(True, alpha=0.3, axis='y')
     
-    # Plot Ch2
+    # --- Plot Ch2 with bands ---
     for band_idx, band in enumerate(ch2_bands):
         mask = (df['Ch2_Amplitude'] >= band['min']) & (df['Ch2_Amplitude'] <= band['max'])
         band_data = df[mask]
+        
         if len(band_data) > 0:
             x_jitter = np.random.uniform(-0.3, 0.3, len(band_data))
+            
+            # Format label using the helper function
+            stats_str = format_population_stats(band["count"], total_droplets)
+            label_text = f'Pop {band_idx+1}: {stats_str}'
+            
             ax2.scatter(x_jitter, band_data['Ch2_Amplitude'],
-                       c=ch2_colors[band_idx], alpha=0.6, s=10)
+                       c=ch2_colors[band_idx], alpha=0.6, s=10,
+                       label=label_text)
+            
+            # Draw threshold line
             if band['threshold_upper'] is not None:
-                ax2.axhline(y=band['threshold_upper'], color='red', linestyle='--', linewidth=1.5)
+                ax2.axhline(y=band['threshold_upper'], color='red', linestyle='--', 
+                           linewidth=2, alpha=0.8)
     
     ax2.set_ylabel(f'{ch2_name} Amplitude', fontsize=12, fontweight='bold')
     ax2.set_xlim(-0.5, 0.5)
-    ax2.set_ylim(ylim_ch2) # Apply explicit limits
+    ax2.set_ylim(ylim_ch2)
     ax2.set_xticks([])
-    ax2.set_title(f'{ch2_name}', fontsize=14, fontweight='bold')
+    ax2.set_title(f'{ch2_name} ({len(ch2_bands)} populations)', fontsize=14, fontweight='bold')
+    if ch2_bands:
+        ax2.legend(loc='best', fontsize=9, framealpha=0.9)
     ax2.grid(True, alpha=0.3, axis='y')
     
+    plt.suptitle(f'Well {well_id} - Population Analysis\n' + 
+                 f'Total droplets: {total_droplets:,}', 
+                 fontsize=16, fontweight='bold')
     plt.tight_layout()
+    
     return fig
 
 
@@ -1666,9 +1745,8 @@ def plot_96well_layout(data_dict, output_base_path, log_func=print,
 
 def create_96well_1d_page(well_info, destination, log_func):
     """
-    Updated: Consistent colors, unconditional red lines, and strict limits.
+    Updated: Lists Count + % for all bands in the 1D view.
     """
-    # Calculate global ranges for fallback
     all_ch1 = [v for info in well_info.values() for v in info['df']['Ch1_Amplitude']]
     all_ch2 = [v for info in well_info.values() for v in info['df']['Ch2_Amplitude']]
     ch1_min_global, ch1_max_global = min(all_ch1), max(all_ch1)
@@ -1685,6 +1763,7 @@ def create_96well_1d_page(well_info, destination, log_func):
             
             info = well_info[well_id]
             df = info['df']
+            total_droplets = len(df)
             
             pos_ch1 = row * 24 + col * 2 + 1
             pos_ch2 = row * 24 + col * 2 + 2
@@ -1692,89 +1771,89 @@ def create_96well_1d_page(well_info, destination, log_func):
             ax1 = plt.subplot(8, 24, pos_ch1)
             ax2 = plt.subplot(8, 24, pos_ch2)
             
-            # --- COLOR LOGIC FIX ---
-            # Determine max logical bands based on thresholds (not data)
+            # --- Colors & Plotting (Same as before) ---
             n_bands_ch1 = len(info.get('ch1_thresholds', [])) + 1
             n_bands_ch2 = len(info.get('ch2_thresholds', [])) + 1
-            
-            # Generate consistent master gradients
             grad_ch1 = create_gradient_colors('#0000FF', n_bands_ch1)
             grad_ch2 = create_gradient_colors('#00FF00', n_bands_ch2)
             
             np.random.seed(42)
             
-            # Plot Ch1 Bands using band_index for color
+            # Plot Ch1
             for band in info['ch1_bands']:
                 mask = (df['Ch1_Amplitude'] >= band['min']) & (df['Ch1_Amplitude'] <= band['max'])
                 band_data = df[mask]
-                
                 if len(band_data) > 0:
                     x_positions = np.random.uniform(-0.4, 0.4, len(band_data))
-                    # Pick color based on the logical index (0=Bottom, 1=Top)
-                    c_idx = min(band['band_index'], len(grad_ch1)-1) 
-                    color = grad_ch1[c_idx]
-                    
+                    c_idx = min(band.get('band_index', 0), len(grad_ch1)-1)
                     ax1.scatter(x_positions, band_data['Ch1_Amplitude'],
-                              c=color, alpha=0.6, s=1.5, edgecolors='none')
+                              c=grad_ch1[c_idx], alpha=0.6, s=1.5, edgecolors='none')
             
-            # --- RED LINE FIX ---
-            # Draw lines UNCONDITIONALLY (outside data loop)
+            # Lines Ch1
             if 'ch1_thresholds' in info:
                 for threshold in info['ch1_thresholds']:
                     ax1.axhline(y=threshold, color='red', linestyle='--', linewidth=0.5, alpha=0.7)
 
-            # Plot Ch2 Bands
+            # Plot Ch2
             for band in info['ch2_bands']:
                 mask = (df['Ch2_Amplitude'] >= band['min']) & (df['Ch2_Amplitude'] <= band['max'])
                 band_data = df[mask]
-                
                 if len(band_data) > 0:
                     x_positions = np.random.uniform(-0.4, 0.4, len(band_data))
-                    c_idx = min(band['band_index'], len(grad_ch2)-1)
-                    color = grad_ch2[c_idx]
-                    
+                    c_idx = min(band.get('band_index', 0), len(grad_ch2)-1)
                     ax2.scatter(x_positions, band_data['Ch2_Amplitude'],
-                              c=color, alpha=0.6, s=1.5, edgecolors='none')
+                              c=grad_ch2[c_idx], alpha=0.6, s=1.5, edgecolors='none')
 
+            # Lines Ch2
             if 'ch2_thresholds' in info:
                 for threshold in info['ch2_thresholds']:
                     ax2.axhline(y=threshold, color='red', linestyle='--', linewidth=0.5, alpha=0.7)
             
-            # --- LIMITS FIX ---
-            # Strictly apply shared limits
+            # --- Limits ---
             ax1.set_xlim(-0.5, 0.5)
             ax1.set_xticks([])
-            ax1.set_yticks([]) # clean look
+            ax1.set_yticks([])
             for spine in ax1.spines.values(): spine.set_visible(False)
-
-            if info.get('limits'):
-                ax1.set_ylim(info['limits']['ch1_limits'])
-            else:
-                ax1.set_ylim(ch1_min_global, ch1_max_global)
+            if info.get('limits'): ax1.set_ylim(info['limits']['ch1_limits'])
+            else: ax1.set_ylim(ch1_min_global, ch1_max_global)
 
             ax2.set_xlim(-0.5, 0.5)
             ax2.set_xticks([])
             ax2.set_yticks([])
             for spine in ax2.spines.values(): spine.set_visible(False)
-
-            if info.get('limits'):
-                ax2.set_ylim(info['limits']['ch2_limits'])
-            else:
-                ax2.set_ylim(ch2_min_global, ch2_max_global)
+            if info.get('limits'): ax2.set_ylim(info['limits']['ch2_limits'])
+            else: ax2.set_ylim(ch2_min_global, ch2_max_global)
             
-            # Text labels (same as before)
+            # --- Text Labels (Updated) ---
             ax1.text(0, 1.05, well_id, transform=ax1.transAxes, 
                     fontsize=6, fontweight='bold', ha='center', va='bottom')
             
-            ch1_stats = ' | '.join([f'{b["proportion"]:.0f}%' for b in info['ch1_bands']])
-            ax1.text(0, -0.15, ch1_stats if ch1_stats else '0%', transform=ax1.transAxes,
-                    fontsize=4.5, ha='center', va='top', color='#000080', family='monospace')
+            # Create stacked string for stats: "100 (10%)"
+            # We use a very small font and \n to stack them if needed, or | separator
+            # Given narrow width, we'll try a condensed vertical stack or tight list
             
-            ch2_stats = ' | '.join([f'{b["proportion"]:.0f}%' for b in info['ch2_bands']])
-            ax2.text(0, -0.15, ch2_stats if ch2_stats else '0%', transform=ax2.transAxes,
-                    fontsize=4.5, ha='center', va='top', color='#008000', family='monospace')
-    
-    # Standard cleanup
+            # Helper to make concise string: "1.2k (50%)"
+            def concise_stats(band):
+                return format_population_stats(band['count'], total_droplets)
+
+            ch1_stats_list = [concise_stats(b) for b in info['ch1_bands']]
+            # Reverse order so top band is on top textually
+            ch1_text = '\n'.join(reversed(ch1_stats_list))
+            
+            ax1.text(0.5, 0.02, ch1_text, transform=ax1.transAxes,
+                    fontsize=3.5, ha='center', va='bottom', color='#000080', 
+                    family='monospace', fontweight='bold',
+                    bbox=dict(facecolor='white', alpha=0.6, linewidth=0, pad=0.5))
+            
+            ch2_stats_list = [concise_stats(b) for b in info['ch2_bands']]
+            ch2_text = '\n'.join(reversed(ch2_stats_list))
+            
+            ax2.text(0.5, 0.02, ch2_text, transform=ax2.transAxes,
+                    fontsize=3.5, ha='center', va='bottom', color='#008000', 
+                    family='monospace', fontweight='bold',
+                    bbox=dict(facecolor='white', alpha=0.6, linewidth=0, pad=0.5))
+
+    # Clean up grid labels
     for col in range(12):
         ax = plt.subplot(8, 24, col * 2 + 1)
         ax.text(1, 1.15, f'{col+1:02d}', transform=ax.transAxes,
@@ -1786,34 +1865,27 @@ def create_96well_1d_page(well_info, destination, log_func):
         ax.text(-0.3, 0.5, row_letter, transform=ax.transAxes,
                fontsize=7, ha='right', va='center', fontweight='bold')
                
-    # Hide empty
     for row in range(8):
         for col in range(12):
             well_id = f'{chr(ord("A") + row)}{col+1:02d}'
             if well_id not in well_info:
-                pos_ch1 = row * 24 + col * 2 + 1
-                pos_ch2 = row * 24 + col * 2 + 2
-                plt.subplot(8, 24, pos_ch1).axis('off')
-                plt.subplot(8, 24, pos_ch2).axis('off')
+                plt.subplot(8, 24, row * 24 + col * 2 + 1).axis('off')
+                plt.subplot(8, 24, row * 24 + col * 2 + 2).axis('off')
 
-    plt.suptitle('96-Well Plate - 1D Band Detection (Strict Thresholds + Global Scaling)', 
+    plt.suptitle('96-Well Plate - 1D Band Detection (Stats: Count + %)', 
                 fontsize=13, fontweight='bold', y=0.995)
     plt.tight_layout(rect=[0.02, 0, 1, 0.99])
     
-    # SAVE LOGIC
     if isinstance(destination, (str, Path)):
-        # Save as PNG
         fig.savefig(destination, dpi=300, bbox_inches='tight')
     else:
-        # Save to PDF Object
         destination.savefig(fig, dpi=200, bbox_inches='tight')
-        
     plt.close(fig)
 
 
 def create_96well_2d_page(well_info, destination, log_func):
     """
-    Updated: Consistent colors, lines, and limits for 2D scatter.
+    Updated: Uses a floating legend list to show stats for ALL populations (no corners).
     """
     all_ch1 = [v for info in well_info.values() for v in info['df']['Ch1_Amplitude']]
     all_ch2 = [v for info in well_info.values() for v in info['df']['Ch2_Amplitude']]
@@ -1831,52 +1903,60 @@ def create_96well_2d_page(well_info, destination, log_func):
             
             info = well_info[well_id]
             df = info['df']
+            total_droplets = len(df)
             
             pos = row * 12 + col + 1
             ax = plt.subplot(8, 12, pos)
             
-            # Generate Colors based on thresholds (Global)
             n_bands_ch1 = len(info.get('ch1_thresholds', [])) + 1
             grad_ch1 = create_gradient_colors('#0000FF', n_bands_ch1)
             
-            # Plot
             ch1_bands = info['ch1_bands']
             ch2_bands = info['ch2_bands']
             
-            for ch1_band in ch1_bands:
+            # Store stats for the legend
+            stats_entries = []
+            
+            for ch1_idx, ch1_band in enumerate(ch1_bands):
                 ch1_mask = (df['Ch1_Amplitude'] >= ch1_band['min']) & (df['Ch1_Amplitude'] <= ch1_band['max'])
                 
                 for ch2_idx, ch2_band in enumerate(ch2_bands):
                     ch2_mask = (df['Ch2_Amplitude'] >= ch2_band['min']) & (df['Ch2_Amplitude'] <= ch2_band['max'])
-                    
                     combined_mask = ch1_mask & ch2_mask
                     band_data = df[combined_mask]
+                    count = len(band_data)
                     
-                    if len(band_data) > 0:
-                        # Use band_index for consistent color
-                        c_idx = min(ch1_band['band_index'], len(grad_ch1)-1)
+                    if count > 0:
+                        c_idx = min(ch1_band.get('band_index', 0), len(grad_ch1)-1)
                         color = grad_ch1[c_idx]
-                        
-                        # Add transparency based on Ch2 index (approximate, since Ch2 bands aren't main color)
                         alpha = 0.3 + (0.4 * ch2_idx / max(len(ch2_bands) - 1, 1))
                         
                         ax.scatter(band_data['Ch1_Amplitude'], 
                                   band_data['Ch2_Amplitude'],
                                   c=color, alpha=alpha, s=0.5, edgecolors='none')
-            
-            # Draw Lines (Unconditionally)
+                        
+                        # Name logic for stats list
+                        if ch1_idx == 0 and ch2_idx == 0: name = "Neg"
+                        elif ch1_idx > 0 and ch2_idx == 0: name = "Fam+"
+                        elif ch1_idx == 0 and ch2_idx > 0: name = "Hex+"
+                        elif ch1_idx > 0 and ch2_idx > 0: name = "Dbl+"
+                        else: name = f"B{ch1_idx}/{ch2_idx}" # Fallback for complex multiplex
+                        
+                        # Add to list
+                        stats_str = format_population_stats(count, total_droplets)
+                        stats_entries.append(f"{name}: {stats_str}")
+
+            # Draw Lines
             if 'ch1_thresholds' in info:
                 for threshold in info['ch1_thresholds']:
                     ax.axvline(x=threshold, color='red', linestyle='--', linewidth=0.3, alpha=0.5)
-            
             if 'ch2_thresholds' in info:
                 for threshold in info['ch2_thresholds']:
                     ax.axhline(y=threshold, color='red', linestyle='--', linewidth=0.3, alpha=0.5)
             
-            # Strict Limits
+            # Limits
             ax.set_xticks([])
             ax.set_yticks([])
-            
             if info.get('limits'):
                 ax.set_xlim(info['limits']['ch1_limits'])
                 ax.set_ylim(info['limits']['ch2_limits'])
@@ -1886,37 +1966,42 @@ def create_96well_2d_page(well_info, destination, log_func):
             
             ax.text(0.5, 1.02, well_id, transform=ax.transAxes, 
                     fontsize=6, fontweight='bold', ha='center', va='bottom')
-    
-    # Add column headers
+            
+            # --- CREATE LEGEND BLOCK ---
+            # Sort: Neg first, then others
+            stats_entries.sort(key=lambda x: 0 if "Neg" in x else 1)
+            
+            full_legend_text = '\n'.join(stats_entries)
+            
+            # Place in top-right corner with background
+            ax.text(0.96, 0.96, full_legend_text, transform=ax.transAxes,
+                   fontsize=3.5, ha='right', va='top', family='monospace',
+                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.75, linewidth=0, pad=0.3))
+
+    # Headers and cleanup
     for col in range(12):
         ax = plt.subplot(8, 12, col + 1)
         ax.text(0.5, 1.12, f'{col+1:02d}', transform=ax.transAxes,
                fontsize=7, ha='center', va='bottom', fontweight='bold')
-    
     for row in range(8):
         ax = plt.subplot(8, 12, row * 12 + 1)
         row_letter = chr(ord('A') + row)
         ax.text(-0.15, 0.5, row_letter, transform=ax.transAxes,
                fontsize=7, ha='right', va='center', fontweight='bold')
-
     for row in range(8):
         for col in range(12):
             well_id = f'{chr(ord("A") + row)}{col+1:02d}'
             if well_id not in well_info:
                 plt.subplot(8, 12, row * 12 + col + 1).axis('off')
 
-    plt.suptitle('96-Well Plate - 2D Scatter (Strict Thresholds + Global Scaling)', 
+    plt.suptitle('96-Well Plate - 2D Scatter (Full Stats in Legend)', 
                 fontsize=13, fontweight='bold', y=0.995)
     plt.tight_layout(rect=[0.02, 0, 1, 0.99])
     
-    # SAVE LOGIC
     if isinstance(destination, (str, Path)):
-        # Save as PNG
         fig.savefig(destination, dpi=300, bbox_inches='tight')
     else:
-        # Save to PDF Object
         destination.savefig(fig, dpi=200, bbox_inches='tight')
-        
     plt.close(fig)
 
 
