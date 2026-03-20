@@ -483,6 +483,19 @@ class BioRadQLPParser:
             cluster_byte = clust_blob[i] if i < len(clust_blob) else 0
             cluster      = self.CLUSTER_MAP.get(cluster_byte, 0)
 
+            # Build a dye-name-specific label so plotting can match by name.
+            # self.channel_names is set by _extract_file_metadata before this runs.
+            cn = self.channel_names or ['Ch1', 'Ch2']
+            c1 = cn[0] if len(cn) > 0 else 'Ch1'
+            c2 = cn[1] if len(cn) > 1 else 'Ch2'
+            _qlp_labels = {
+                0: 'Gated',
+                1: f'{c1}−  {c2}−',
+                2: f'{c1}+  {c2}−',
+                3: f'{c1}+  {c2}+',
+                4: f'{c1}−  {c2}+',
+            }
+
             # EventGatingFlags: uint32[NbChannels][N]; read channel-0 flag for droplet i
             gating_flag = 0
             if gating_blob:
@@ -505,7 +518,7 @@ class BioRadQLPParser:
                 'Ch2_Width':     raw[5],
                 'Ch2_Quality':   raw[6],
                 'Cluster':       cluster,
-                'Cluster_Label': self.CLUSTER_LABELS.get(cluster, 'Unknown'),
+                'Cluster_Label': _qlp_labels.get(cluster, 'Unknown'),
                 'Gating_Flag':   gating_flag,
             }
             rec.update(meta_cols)
