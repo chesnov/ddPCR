@@ -74,216 +74,8 @@ except ImportError:
     from PyQt5.QtGui import QFont, QPalette, QColor, QDragEnterEvent, QDropEvent
 
 
-class BioRadQLPParser:
-    """Minimal robust parser - reads well IDs directly from IFD data"""
-    
-    def __init__(self, filepath, debug=False):
-        self.filepath = filepath
-        self.debug = debug
-        
-        with open(filepath, 'rb') as f:
-            self.data = f.read()
-        
-        self.endian = '<' if self.data[:2] == b'II' else '>'
-        
-        # Constants
-        self.RECORD_SIZE = 28
-        self.RECORD_FMT = "I fff fff"
-        
-        # Tag IDs
-        self.TAG_WELL_NAME = 65019
-        self.TAG_DATA_START = 65021
-        self.TAG_CLUSTER_ARRAY = 65057
-        self.TAG_QUALITY_ARRAY = 65054
-        self.TAG_WELL_QUALITY = 65005
-        self.TAG_CHANNEL_NAMES = 65004
-        self.TAG_SOFTWARE = 305
-        
-        self.channel_names = None
-        
-        self.CLUSTER_BYTE_MAP = {
-            0x00: 0, 0x11: 1, 0x22: 2, 0x33: 3, 0x44: 4
-        }
-        
-        self.metadata = {}
-        self.well_metadata = {}
-
-    def _get_val(self, offset, fmt):
-        try:
-            return struct.unpack(f"{self.endian}{fmt}", 
-                               self.data[offset:offset+struct.calcsize(fmt)])[0]
-        except:
-            return None
-    
-    def _extract_tags(self, ifd_offset):
-        """Extract all tags from an IFD"""
-        num_entries = self._get_val(ifd_offset, "H")
-        tags = {}
-        
-        if num_entries is None:
-            return tags
-            
-        for i in range(num_entries):
-            entry_ptr = ifd_offset + 2 + (i * 12)
-            tid = self._get_val(entry_ptr, "H")
-            ttype = self._get_val(entry_ptr + 2, "H")
-            count = self._get_val(entry_ptr + 4, "I")
-            
-            type_sizes = {1:1, 2:1, 3:2, 4:4, 5:8, 7:1, 9:4, 11:4, 12:8}
-            item_size = type_sizes.get(ttype, 1)
-            total_size = item_size * count
-            
-            val_or_offset = self._get_val(entry_ptr + 8, "I")
-            ptr = entry_ptr + 8 if total_size <= 4 else val_or_offset
-            
-            tags[tid] = (ptr, total_size, ttype, count)
-        
-        return tags
-
-    def _read_well_id_from_ifd(self, ifd_offset):
-        """
-        Read well ID directly from IFD data.
-        Pattern: IFD starts with: 1c 00 fb fd 02 00 01 00 00 00 [WELL_ID]\x00
-        Well ID is at offset +10 from IFD start (e.g., "C03", "D04")
-        """
-        # Read 4 bytes starting at offset +10
-        well_id_offset = ifd_offset + 10
-        well_id_bytes = self.data[well_id_offset:well_id_offset+4]
-        
-        # Parse as null-terminated string
-        try:
-            well_id = well_id_bytes.split(b'\x00')[0].decode('ascii')
-            # Validate format: [A-H][0-9][0-9]
-            if len(well_id) == 3 and well_id[0] in 'ABCDEFGH' and well_id[1:].isdigit():
-                return well_id
-        except:
-            pass
-        
-        return None
-
-    def _extract_metadata(self):
-        """Extract file metadata"""
-        ifd_offset = self._get_val(4, "I")
-        if not ifd_offset:
-            return
-
-        tags = self._extract_tags(ifd_offset)
-        
-        if self.TAG_SOFTWARE in tags:
-            ptr, size, _, _ = tags[self.TAG_SOFTWARE]
-            if ptr and size:
-                self.metadata['software'] = self.data[ptr:ptr+size].decode('ascii', errors='ignore').split('\x00')[0]
-        
-        if self.TAG_CHANNEL_NAMES in tags:
-            ptr, size, _, _ = tags[self.TAG_CHANNEL_NAMES]
-            if ptr and size:
-                channel_str = self.data[ptr:ptr+size].decode('ascii', errors='ignore').split('\x00')[0]
-                self.channel_names = [ch.strip() for ch in channel_str.split(',')]
-        
-        if not self.channel_names:
-            self.channel_names = ['Ch1', 'Ch2']
-
-    def parse_to_dataframe(self, include_filtered=True):
-        """Parse QLP file and return dict of well_id -> DataFrame"""
-        self._extract_metadata()
-        
-        ifd_offset = self._get_val(4, "I")
-        well_data = defaultdict(list)
-
-        while ifd_offset and ifd_offset < len(self.data):
-            tags = self._extract_tags(ifd_offset)
-            num_entries = self._get_val(ifd_offset, "H")
-            
-            if not num_entries:
-                break
-
-            # Check if this is a well block
-            if (self.TAG_WELL_NAME in tags and 
-                self.TAG_DATA_START in tags and 
-                self.TAG_CLUSTER_ARRAY in tags):
-                
-                cluster_size = tags[self.TAG_CLUSTER_ARRAY][1]
-                
-                # Skip empty wells
-                if cluster_size == 0:
-                    ifd_offset = self._get_val(ifd_offset + 2 + (num_entries * 12), "I")
-                    continue
-                
-                # Read well ID directly from IFD
-                well_id = self._read_well_id_from_ifd(ifd_offset)
-                
-                if not well_id:
-                    if self.debug:
-                        print(f"Warning: Could not read well ID at IFD offset 0x{ifd_offset:08x}")
-                    ifd_offset = self._get_val(ifd_offset + 2 + (num_entries * 12), "I")
-                    continue
-                
-                if self.debug:
-                    print(f"Well {well_id}: {cluster_size} droplets")
-                
-                # Extract well metadata
-                well_meta = {}
-                if self.TAG_WELL_QUALITY in tags:
-                    ptr = tags[self.TAG_WELL_QUALITY][0]
-                    well_meta['well_quality_flag'] = self._get_val(ptr, 'f')
-                
-                self.well_metadata[well_id] = well_meta
-                
-                # Read droplet data
-                cluster_array = self.data[tags[self.TAG_CLUSTER_ARRAY][0]:
-                                         tags[self.TAG_CLUSTER_ARRAY][0]+cluster_size]
-                
-                quality_array = None
-                if self.TAG_QUALITY_ARRAY in tags:
-                    q_ptr, q_size = tags[self.TAG_QUALITY_ARRAY][0], tags[self.TAG_QUALITY_ARRAY][1]
-                    if q_size > 0:
-                        quality_array = self.data[q_ptr:q_ptr+q_size]
-                
-                cursor = tags[self.TAG_DATA_START][0]
-                droplet_idx = 0
-                
-                while cursor < len(self.data) - self.RECORD_SIZE and droplet_idx < len(cluster_array):
-                    r = struct.unpack(f"{self.endian}{self.RECORD_FMT}", 
-                                     self.data[cursor:cursor+self.RECORD_SIZE])
-                    
-                    cluster = self.CLUSTER_BYTE_MAP.get(cluster_array[droplet_idx], 0)
-                    quality_flag = quality_array[droplet_idx] if quality_array and droplet_idx < len(quality_array) else 0
-                    
-                    if include_filtered or cluster > 0:
-                        droplet = {
-                            'DropletID': r[0],
-                            'Ch1_Amplitude': r[1],
-                            'Ch2_Amplitude': r[4],
-                            'Cluster': cluster,
-                            'Quality_Flag': quality_flag,
-                        }
-                        droplet.update(well_meta)
-                        well_data[well_id].append(droplet)
-                    
-                    droplet_idx += 1
-                    cursor += self.RECORD_SIZE
-
-            # Move to next IFD
-            ifd_offset = self._get_val(ifd_offset + 2 + (num_entries * 12), "I")
-
-        # Convert to DataFrames
-        well_dataframes = {}
-        for well_id, data in well_data.items():
-            if data:
-                df = pd.DataFrame(data)
-                df.attrs['channel_names'] = self.channel_names
-                df.attrs['channel_map'] = {
-                    'Ch1_Amplitude': self.channel_names[0],
-                    'Ch2_Amplitude': self.channel_names[1]
-                }
-                well_dataframes[well_id] = df
-        
-        return well_dataframes
-
-    def get_channel_names(self):
-        if self.channel_names is None:
-            self._extract_metadata()
-        return self.channel_names or ['Ch1', 'Ch2']
+# Full-featured QLP and ddPCR parsers live in ddpcr_parsers.py (drop in same folder)
+from ddpcr_parsers import BioRadQLPParser, BioRadDdpcrParser
 
 
 class WellAssignmentDialog(QDialog):
@@ -582,7 +374,15 @@ class ProcessingThread(QThread):
                     self.well_assignments,
                     self.include_filtered,
                     self.progress.emit,
-                    self.output_format # Pass to function
+                    self.output_format
+                )
+            elif self.file_type == 'ddpcr':
+                output_dir, stats_file = process_ddpcr_file(
+                    self.files[0],
+                    self.well_assignments,
+                    self.include_filtered,
+                    self.progress.emit,
+                    self.output_format
                 )
             else:
                 output_dir, stats_file = process_ddpcr_files(
@@ -652,6 +452,7 @@ class DropZone(QLabel):
     def dropEvent(self, event: QDropEvent):
         csv_files = []
         qlp_files = []
+        ddpcr_files = []
         
         for url in event.mimeData().urls():
             file_path = url.toLocalFile()
@@ -659,11 +460,17 @@ class DropZone(QLabel):
                 csv_files.append(file_path)
             elif file_path.endswith('.qlp'):
                 qlp_files.append(file_path)
+            elif file_path.endswith('.ddpcr'):
+                ddpcr_files.append(file_path)
         
         if qlp_files:
             if len(qlp_files) > 1:
                 QMessageBox.warning(None, "Warning", "Only one QLP file can be processed at a time. Using the first file.")
             self.files_dropped.emit([qlp_files[0]], 'qlp')
+        elif ddpcr_files:
+            if len(ddpcr_files) > 1:
+                QMessageBox.warning(None, "Warning", "Only one ddPCR file can be processed at a time. Using the first file.")
+            self.files_dropped.emit([ddpcr_files[0]], 'ddpcr')
         elif csv_files:
             self.files_dropped.emit(csv_files, 'csv')
         
@@ -698,14 +505,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
         
         # Subtitle
-        subtitle = QLabel("Drag and drop Bio-Rad CSV files or QLP binary files")
+        subtitle = QLabel("Drag and drop Bio-Rad CSV files, QLP binary files, or ddPCR encrypted files")
         subtitle.setFont(QFont("Arial", 12))
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setStyleSheet("color: #7f8c8d; margin-bottom: 20px;")
         layout.addWidget(subtitle)
         
         # Drop zone
-        self.drop_zone = DropZone("📁 Drop CSV or QLP files here\n\nor click 'Browse Files' below")
+        self.drop_zone = DropZone("📁 Drop CSV, QLP, or ddPCR files here\n\nor click a 'Browse' button below")
         self.drop_zone.files_dropped.connect(self.process_files)
         layout.addWidget(self.drop_zone)
 
@@ -762,9 +569,27 @@ class MainWindow(QMainWindow):
         """)
         browse_qlp_btn.clicked.connect(self.browse_qlp_file)
         
+        browse_ddpcr_btn = QPushButton("📂 Browse ddPCR File")
+        browse_ddpcr_btn.setFont(QFont("Arial", 11))
+        browse_ddpcr_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #e67e22;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #d35400;
+            }
+        """)
+        browse_ddpcr_btn.clicked.connect(self.browse_ddpcr_file)
+        
         browse_layout.addStretch()
         browse_layout.addWidget(browse_csv_btn)
         browse_layout.addWidget(browse_qlp_btn)
+        browse_layout.addWidget(browse_ddpcr_btn)
         browse_layout.addStretch()
         layout.addLayout(browse_layout)
         
@@ -801,9 +626,10 @@ class MainWindow(QMainWindow):
         
         # Initial log message
         self.log("Welcome to ddPCRvis!")
-        self.log("Drop CSV files, QLP files, or click 'Browse Files' to get started.")
+        self.log("Drop CSV files, QLP files, ddPCR files, or click a 'Browse' button to get started.")
         self.log("- CSV files: Will be plotted individually and combined")
         self.log("- QLP files: Will prompt for well-to-condition assignments")
+        self.log("- ddPCR files: Decrypted automatically, then same workflow as QLP")
         
     def log(self, message):
         """Add a message to the log area"""
@@ -831,6 +657,17 @@ class MainWindow(QMainWindow):
         if file:
             self.process_files([file], 'qlp')
     
+    def browse_ddpcr_file(self):
+        """Open file dialog to select a ddPCR file"""
+        file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select ddPCR File",
+            "",
+            "ddPCR Files (*.ddpcr)"
+        )
+        if file:
+            self.process_files([file], 'ddpcr')
+    
     def process_files(self, files, file_type):
         """Process the selected files"""
         if not files:
@@ -846,12 +683,16 @@ class MainWindow(QMainWindow):
         well_assignments = None
         include_filtered = True  # Default for CSV files
         
-        if file_type == 'qlp':
-            # Parse QLP file to get well IDs (quick parse to get well names only)
+        if file_type in ('qlp', 'ddpcr'):
+            # Parse file to get well IDs, then show assignment dialog
             try:
-                self.log("Parsing QLP file...")
-                parser = BioRadQLPParser(files[0])
-                # Quick parse just to get well IDs
+                if file_type == 'qlp':
+                    self.log("Parsing QLP file...")
+                    parser = BioRadQLPParser(files[0])
+                else:
+                    self.log("Decrypting and parsing ddPCR file...")
+                    parser = BioRadDdpcrParser(files[0])
+                
                 well_dataframes = parser.parse_to_dataframe(include_filtered=True)
                 well_ids = list(well_dataframes.keys())
                 
@@ -869,8 +710,8 @@ class MainWindow(QMainWindow):
                     return
                     
             except Exception as e:
-                self.log(f"Error parsing QLP file: {str(e)}")
-                QMessageBox.critical(self, "Error", f"Failed to parse QLP file:\n{str(e)}")
+                self.log(f"Error parsing file: {str(e)}")
+                QMessageBox.critical(self, "Error", f"Failed to parse file:\n{str(e)}")
                 return
         
         # Start processing in background thread
@@ -2225,6 +2066,129 @@ def process_qlp_file(qlp_file, well_assignments, include_filtered, log_func=prin
     
     return output_dir, stats_file
 
+
+def process_ddpcr_file(ddpcr_file, well_assignments, include_filtered, log_func=print, output_format='png'):
+    """Process a .ddpcr encrypted archive — identical flow to process_qlp_file()."""
+
+    ddpcr_path = Path(ddpcr_file)
+    base_dir   = ddpcr_path.parent
+    output_dir = base_dir / "plots"
+    output_dir.mkdir(exist_ok=True)
+
+    csv_dir = output_dir / "well_csvs"
+    csv_dir.mkdir(exist_ok=True)
+
+    log_func(f"\nOutput directory: {output_dir}")
+    log_func(f"Well CSV directory: {csv_dir}")
+    log_func(f"Decrypting and parsing ddPCR file: {ddpcr_path.name}")
+    log_func(f"Include filtered droplets (Cluster 0): {include_filtered}")
+
+    parser = BioRadDdpcrParser(ddpcr_file)
+    well_dataframes = parser.parse_to_dataframe(include_filtered=include_filtered)
+
+    log_func(f"Extracted {len(well_dataframes)} wells")
+
+    # Calculate shared thresholds if we have condition assignments
+    use_shared_thresholds = well_assignments and len(set(well_assignments.values())) > 0
+    shared_thresh = None
+
+    if use_shared_thresholds:
+        log_func("\nCalculating shared thresholds per condition...")
+        shared_thresh = calculate_shared_thresholds(
+            well_dataframes,
+            well_assignments,
+            method='2d_gmm'
+        )
+        log_func(f"  Calculated thresholds for {len(shared_thresh)} condition(s)")
+
+        for condition, thresholds in shared_thresh.items():
+            ch1_str = ', '.join([f'{t:.1f}' for t in thresholds['ch1_thresholds']])
+            ch2_str = ', '.join([f'{t:.1f}' for t in thresholds['ch2_thresholds']])
+            log_func(f"    {condition}: Ch1=[{ch1_str}], Ch2=[{ch2_str}]")
+
+    all_stats_rows = []
+
+    for well_id, df in sorted(well_dataframes.items()):
+        channel_map = df.attrs.get('channel_map', {})
+        ch1_name = channel_map.get('Ch1_Amplitude', 'Ch1')
+        ch2_name = channel_map.get('Ch2_Amplitude', 'Ch2')
+
+        df_export = df.copy()
+        df_export = df_export.rename(columns={
+            'Ch1_Amplitude': f'{ch1_name}_Amplitude',
+            'Ch2_Amplitude': f'{ch2_name}_Amplitude'
+        })
+
+        csv_path = csv_dir / f"{well_id}.csv"
+        df_export.to_csv(csv_path, index=False)
+
+        cluster_counts = df['Cluster'].value_counts().to_dict()
+        cluster_str = ', '.join([f"C{c}:{cluster_counts.get(c, 0)}" for c in sorted(cluster_counts.keys())])
+        log_func(f"  Exported: {well_id}.csv ({len(df)} droplets - {cluster_str}) [{ch1_name}, {ch2_name}]")
+
+        if use_shared_thresholds:
+            condition = well_assignments.get(well_id, 'Unassigned')
+            thresholds = shared_thresh.get(condition, {'ch1_thresholds': [], 'ch2_thresholds': []})
+
+            ch1_bands = apply_thresholds_to_get_bands(
+                df['Ch1_Amplitude'].values,
+                thresholds['ch1_thresholds'],
+                percentile_bounds=True
+            )
+            ch2_bands = apply_thresholds_to_get_bands(
+                df['Ch2_Amplitude'].values,
+                thresholds['ch2_thresholds'],
+                percentile_bounds=True
+            )
+
+            stats_rows, _, _ = calculate_well_band_statistics(well_id, df, ch1_bands, ch2_bands)
+        else:
+            stats_rows, ch1_bands, ch2_bands = calculate_well_band_statistics(well_id, df, use_gmm=True)
+
+        all_stats_rows.extend(stats_rows)
+
+        condition = well_assignments.get(well_id, 'Unassigned')
+        for row in stats_rows:
+            row['Condition'] = condition
+
+        fig = plot_well_with_bands(df, well_id, ch1_bands, ch2_bands)
+        if condition != 'Unassigned':
+            fig.suptitle(f'Well {well_id} ({condition}) - Band Detection', fontsize=16, fontweight='bold')
+
+        plot_path = output_dir / f"{well_id}_1D_plot.{output_format}"
+        fig.savefig(plot_path, format=output_format, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+        fig_2d = plot_well_2d_scatter(df, well_id, ch1_bands, ch2_bands)
+        if condition != 'Unassigned':
+            fig_2d.axes[0].set_title(f'Well {well_id} ({condition}) - 2D Scatter (Ch1 vs Ch2)',
+                                     fontsize=14, fontweight='bold')
+
+        plot_2d_path = output_dir / f"{well_id}_2D_plot.{output_format}"
+        fig_2d.savefig(plot_2d_path, format=output_format, dpi=300, bbox_inches='tight')
+        plt.close(fig_2d)
+
+    log_func(f"\nGenerated {len(well_dataframes)} individual well plots (1D and 2D)")
+
+    log_func(f"\nCreating 96-well plate overview...")
+    plate_data = dict(well_dataframes)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    plate_output = output_dir / f"{ddpcr_path.stem}_96well_plate_{timestamp}"
+    plot_96well_layout(plate_data, plate_output, log_func,
+                       condition_assignments=well_assignments,
+                       use_shared_thresholds=use_shared_thresholds,
+                       output_format=output_format)
+
+    stats_file = None
+    if all_stats_rows:
+        stats_df = pd.DataFrame(all_stats_rows)
+        filtered_suffix = "_all" if include_filtered else "_accepted"
+        stats_file = output_dir / f"{ddpcr_path.stem}_band_statistics{filtered_suffix}_{timestamp}.csv"
+        stats_df.to_csv(stats_file, index=False)
+        log_func(f"\nBand statistics saved to: {stats_file.name}")
+        log_func(f"Individual well CSVs saved to: {csv_dir.name}/")
+
+    return output_dir, stats_file
 
 def main():
     app = QApplication(sys.argv)
