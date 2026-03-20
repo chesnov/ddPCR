@@ -71,14 +71,17 @@ class BioRadQLPParser:
       N × 12    : tag entries  [tag_id(2) | type(2) | count(4) | value_or_offset(4)]
       4 bytes   : offset to next IFD  (0 = done)
 
-    Droplet record: 28 bytes
+    Droplet record: 28 bytes  (confirmed from ManagedQLEvent struct layout)
       uint32  Timestamp
-      float   Ch1_Amplitude
-      float   Ch1_Quality
-      float   Ch1_Width
-      float   Ch2_Amplitude
-      float   Ch2_Quality
-      float   Ch2_Width
+      float   Amplitude0  → Ch1_Amplitude
+      float   Width0      → Ch1_Width
+      float   Quality0    → Ch1_Quality
+      float   Amplitude1  → Ch2_Amplitude
+      float   Width1      → Ch2_Width
+      float   Quality1    → Ch2_Quality
+
+    Note: Width0==Width1 and Quality0==Quality1 — they are single per-droplet
+    scalars that BioRad writes into both channel slots of the record.
     """
 
     # ── Tag IDs ────────────────────────────────────────────────────────────
@@ -88,7 +91,7 @@ class BioRadQLPParser:
 
     # Bio-Rad custom (0xFE00 range)
     TAG_CHANNEL_NAMES       = 65004  # "Ch1,Ch2" or "FAM,HEX" etc.
-    TAG_WELL_QUALITY_SCORE  = 65005  # float: overall well quality score
+    TAG_FLOW_RATE           = 65005  # float: droplet flow rate (µL/hr)
     TAG_CONCENTRATION       = 65006  # float[2]: copies/µL per channel
     TAG_CONF_LOWER          = 65007  # float[2]: 95 % CI lower bound
     TAG_CONF_UPPER          = 65008  # float[2]: 95 % CI upper bound
@@ -105,21 +108,24 @@ class BioRadQLPParser:
     TAG_WELL_NAME           = 65019  # ASCII: well ID e.g. "A01"
     TAG_EXPERIMENT_NAME     = 65020  # ASCII: experiment name
     TAG_DATA_START          = 65021  # Offset to first droplet record
-    TAG_REJECTED_EVENTS     = 65022  # uint32
-    TAG_SATURATED_EVENTS    = 65023  # uint32
-    TAG_DROPLET_VOLUME      = 65026  # float: nL
+    TAG_REJECTED_EVENTS     = 65022  # uint32: rejected droplet count
+    TAG_SATURATED_EVENTS    = 65023  # uint32: saturated droplet count
     TAG_PLATE_ID            = 65030  # ASCII
     TAG_RUN_DATE            = 65031  # ASCII
     TAG_INSTRUMENT_SN       = 65032  # ASCII
     TAG_INSTRUMENT_MAKE     = 65033  # ASCII
     TAG_INSTRUMENT_MODEL    = 65034  # ASCII
-    TAG_WAS_THRESHOLDED     = 65040  # uint8/bool
-    TAG_MIN_WIDTH_GATE      = 65041  # float
-    TAG_MAX_WIDTH_GATE      = 65042  # float
-    TAG_SYSTEM_VERSION      = 65050  # uint16
-    TAG_QUALITY_ARRAY       = 65054  # byte[N]: per-droplet quality flag
+    TAG_EVENT_GATING_FLAGS  = 65054  # uint32[NbChannels][N]: per-channel per-droplet gating flags
     TAG_CLUSTER_ARRAY       = 65057  # byte[N]: per-droplet cluster assignment
-    TAG_WELL_QUALITY_FLAGS  = 65058  # uint64[2]: per-channel quality bitmask
+    TAG_CLUSTER_MODES       = 65058  # bool[NbChannels]: cluster algorithm enabled per channel
+    TAG_EVENT_CLUSTER_CONF  = 65065  # float: cluster events confidence
+    TAG_MULTIWELL_CLUST_CONF= 65066  # float: multi-well cluster events confidence
+    TAG_WAS_THRESHOLDED     = 65067  # uint8/bool
+    TAG_SYSTEM_VERSION      = 65074  # uint16
+    TAG_COLOR_COMP_GRP_IDX  = 65075  # uint32: color compensation matrix group index
+    TAG_DROPLET_VOLUME      = 65078  # float: nL per-well
+    TAG_WELL_COMP_MATRIX    = 65079  # uint16: well compensation matrix selected mask
+    TAG_PRODUCTION_GATING   = 65081  # uint32: production gating mask
 
     # Droplet record
     RECORD_SIZE = 28
@@ -378,27 +384,13 @@ class BioRadQLPParser:
         if sat is not None:
             m['saturated_droplets'] = sat
 
-        # Quality
-        wq = self._t_float(tags, self.TAG_WELL_QUALITY_SCORE)
-        if wq is not None:
-            m['well_quality_score'] = wq
+        # Flow rate
+        fr = self._t_float(tags, self.TAG_FLOW_RATE)
+        if fr is not None:
+            m['flow_rate'] = fr
 
-        flags_raw = self._t_bytes(tags, self.TAG_WELL_QUALITY_FLAGS)
-        if flags_raw and len(flags_raw) >= 8:
-            m['quality_flags_ch1'] = struct.unpack(f"{self.endian}Q",
-                                                    flags_raw[:8])[0]
-            if len(flags_raw) >= 16:
-                m['quality_flags_ch2'] = struct.unpack(f"{self.endian}Q",
-                                                        flags_raw[8:16])[0]
-
-        # Width gates
-        wg_min = self._t_float(tags, self.TAG_MIN_WIDTH_GATE)
-        if wg_min is not None:
-            m['min_width_gate'] = wg_min
-
-        wg_max = self._t_float(tags, self.TAG_MAX_WIDTH_GATE)
-        if wg_max is not None:
-            m['max_width_gate'] = wg_max
+        # Width gates are embedded inside QuantitationProcessingDetail blobs
+        # in the data IFD; no standalone float tags exist for them.
 
         # Misc
         wt = self._t_uint32(tags, self.TAG_WAS_THRESHOLDED)
@@ -436,11 +428,11 @@ class BioRadQLPParser:
         if n == 0:
             return []
 
-        q_blob = None
-        if self.TAG_QUALITY_ARRAY in tags:
-            qi = tags[self.TAG_QUALITY_ARRAY]
-            if qi['size'] > 0:
-                q_blob = self.data[qi['ptr']:qi['ptr'] + qi['size']]
+        gating_blob = None
+        if self.TAG_EVENT_GATING_FLAGS in tags:
+            gi = tags[self.TAG_EVENT_GATING_FLAGS]
+            if gi['size'] > 0:
+                gating_blob = self.data[gi['ptr']:gi['ptr'] + gi['size']]
 
         cursor  = tags[self.TAG_DATA_START]['ptr']
         rec_fmt = f"{self.endian}{self.RECORD_FMT}"
@@ -456,11 +448,19 @@ class BioRadQLPParser:
 
             raw = struct.unpack(rec_fmt,
                                 self.data[cursor:cursor + self.RECORD_SIZE])
-            # raw = (Timestamp, Ch1_Amp, Ch1_Quality, Ch1_Width,
-            #                   Ch2_Amp, Ch2_Quality, Ch2_Width)
+            # raw = (Timestamp, Amplitude0, Width0, Quality0,
+            #                   Amplitude1, Width1, Quality1)
+            # Width0==Width1 and Quality0==Quality1 (single scalar, duplicated)
             cluster_byte = clust_blob[i] if i < len(clust_blob) else 0
             cluster      = self.CLUSTER_MAP.get(cluster_byte, 0)
-            q_flag       = q_blob[i] if (q_blob and i < len(q_blob)) else 0
+
+            # EventGatingFlags: uint32[NbChannels][N]; read channel-0 flag for droplet i
+            gating_flag = 0
+            if gating_blob:
+                gf_offset = i * 4
+                if gf_offset + 4 <= len(gating_blob):
+                    gating_flag = struct.unpack_from(f'{self.endian}I',
+                                                     gating_blob, gf_offset)[0]
 
             if not include_filtered and cluster == 0:
                 cursor += self.RECORD_SIZE
@@ -470,14 +470,14 @@ class BioRadQLPParser:
                 'Droplet_Index': i,
                 'Timestamp':     raw[0],
                 'Ch1_Amplitude': raw[1],
-                'Ch1_Quality':   raw[2],
-                'Ch1_Width':     raw[3],
+                'Ch1_Width':     raw[2],
+                'Ch1_Quality':   raw[3],
                 'Ch2_Amplitude': raw[4],
-                'Ch2_Quality':   raw[5],
-                'Ch2_Width':     raw[6],
+                'Ch2_Width':     raw[5],
+                'Ch2_Quality':   raw[6],
                 'Cluster':       cluster,
                 'Cluster_Label': self.CLUSTER_LABELS.get(cluster, 'Unknown'),
-                'Quality_Flag':  q_flag,
+                'Gating_Flag':   gating_flag,
             }
             rec.update(meta_cols)
             records.append(rec)
@@ -585,7 +585,7 @@ class BioRadDdpcrParser:
     so all downstream ddPCRvis plotting/stats code is shared transparently.
     """
 
-    SECRET_KEY = "DbCdNa2OrCaDx56#4"
+    SECRET_KEY = "DbCdNa2OrCaDx56#4" #https://www.youtube.com/watch?v=Ft5bW5MEOCM
 
     # Cluster call bytes (from converter GetEventData):
     #   0  = gated/filtered    17 (0x11) = NN
@@ -1099,139 +1099,3 @@ def _attach_attrs(df: pd.DataFrame, channel_names: List[str],
     }
     df.attrs['well_metadata'] = well_meta
     df.attrs['file_metadata'] = file_meta
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  INTEGRATION GUIDE — changes needed in ddPCRvis.py
-# ═══════════════════════════════════════════════════════════════════════════════
-"""
-1. REPLACE the BioRadQLPParser class
-   ─────────────────────────────────
-   Delete the entire BioRadQLPParser class (~210 lines) and replace it with:
-
-       from ddpcr_parsers import BioRadQLPParser, BioRadDdpcrParser
-
-   Place this import near the top of ddPCRvis.py, after the stdlib imports.
-
-
-2. DropZone.dropEvent — add .ddpcr support
-   ─────────────────────────────────────────
-   In the dropEvent method, alongside the csv/qlp detection, add:
-
-       ddpcr_files = []
-       for url in event.mimeData().urls():
-           file_path = url.toLocalFile()
-           if file_path.endswith('.csv'):
-               csv_files.append(file_path)
-           elif file_path.endswith('.qlp'):
-               qlp_files.append(file_path)
-           elif file_path.endswith('.ddpcr'):          # ← NEW
-               ddpcr_files.append(file_path)           # ← NEW
-
-       if qlp_files:
-           ...
-       elif ddpcr_files:                               # ← NEW block
-           if len(ddpcr_files) > 1:
-               QMessageBox.warning(None, "Warning",
-                   "Only one ddPCR file at a time. Using first.")
-           self.files_dropped.emit([ddpcr_files[0]], 'ddpcr')
-       elif csv_files:
-           ...
-
-   Also update the subtitle label and file filter strings to mention .ddpcr.
-
-
-3. MainWindow — add Browse ddPCR button
-   ──────────────────────────────────────
-   In setup_ui (or __init__), alongside the browse_qlp_btn, add:
-
-       browse_ddpcr_btn = QPushButton("📂 Browse ddPCR File")
-       browse_ddpcr_btn.setStyleSheet(\"\"\"
-           QPushButton { background-color: #e67e22; color: white;
-                         border: none; padding: 10px 20px;
-                         border-radius: 5px; font-weight: bold; }
-           QPushButton:hover { background-color: #d35400; }
-       \"\"\")
-       browse_ddpcr_btn.clicked.connect(self.browse_ddpcr_file)
-       browse_layout.addWidget(browse_ddpcr_btn)
-
-   And add the handler method:
-
-       def browse_ddpcr_file(self):
-           file, _ = QFileDialog.getOpenFileName(
-               self, "Select ddPCR File", "",
-               "ddPCR Files (*.ddpcr)")
-           if file:
-               self.process_files([file], 'ddpcr')
-
-
-4. ProcessingThread.run() — route ddpcr
-   ──────────────────────────────────────
-   In the run() method, add a branch alongside the 'qlp' branch:
-
-       if self.file_type == 'qlp':
-           output_dir, stats_file = process_qlp_file(
-               self.files[0], self.well_assignments,
-               self.include_filtered, self.progress.emit,
-               self.output_format)
-       elif self.file_type == 'ddpcr':                 # ← NEW
-           output_dir, stats_file = process_ddpcr_file( # ← NEW
-               self.files[0], self.well_assignments,
-               self.include_filtered, self.progress.emit,
-               self.output_format)
-       else:
-           output_dir, stats_file = process_ddpcr_files(...)
-
-
-5. Add process_ddpcr_file() function
-   ────────────────────────────────────
-   Add this function near process_qlp_file() — it is essentially identical
-   but uses BioRadDdpcrParser instead:
-
-       def process_ddpcr_file(ddpcr_file, well_assignments, include_filtered,
-                              log_func=print, output_format='png'):
-           \"\"\"Process a .ddpcr file — same flow as process_qlp_file().\"\"\"
-           ddpcr_path = Path(ddpcr_file)
-           base_dir   = ddpcr_path.parent
-           output_dir = base_dir / "plots"
-           output_dir.mkdir(exist_ok=True)
-           csv_dir = output_dir / "well_csvs"
-           csv_dir.mkdir(exist_ok=True)
-
-           log_func(f"\\nDecrypting and parsing: {ddpcr_path.name}")
-           log_func(f"Include filtered droplets: {include_filtered}")
-
-           parser = BioRadDdpcrParser(ddpcr_file)
-           well_dataframes = parser.parse_to_dataframe(
-               include_filtered=include_filtered)
-
-           log_func(f"Extracted {len(well_dataframes)} wells")
-
-           # From here the logic is identical to process_qlp_file() —
-           # you can factor both into a shared _process_well_dataframes()
-           # helper, or just duplicate the body.
-           # The well_dataframes dict has the same schema in both cases.
-
-   The simplest approach is to refactor process_qlp_file() to accept a
-   pre-built well_dataframes dict and call it from both functions:
-
-       def _process_well_dataframes(well_dataframes, source_path,
-                                    well_assignments, include_filtered,
-                                    log_func, output_format):
-           # ... the body of process_qlp_file starting from
-           #     "# Calculate shared thresholds..." onwards ...
-
-       def process_qlp_file(qlp_file, well_assignments, include_filtered,
-                            log_func=print, output_format='png'):
-           parser = BioRadQLPParser(qlp_file)
-           wdfs   = parser.parse_to_dataframe(include_filtered=include_filtered)
-           log_func(f"Extracted {len(wdfs)} wells")
-           return _process_well_dataframes(wdfs, Path(qlp_file), ...)
-
-       def process_ddpcr_file(ddpcr_file, well_assignments, include_filtered,
-                              log_func=print, output_format='png'):
-           parser = BioRadDdpcrParser(ddpcr_file)
-           wdfs   = parser.parse_to_dataframe(include_filtered=include_filtered)
-           log_func(f"Extracted {len(wdfs)} wells")
-           return _process_well_dataframes(wdfs, Path(ddpcr_file), ...)
-"""
